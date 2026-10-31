@@ -34,6 +34,13 @@
 //! answer is used by `body::emit_entry_allocas` via
 //! [`align_pointer_addr_space`] to pick an alloca pointee that matches what
 //! actually gets stored.
+//!
+//! A local whose own slot is borrowed (`&local`, `&raw local`) is never
+//! narrowed. The borrow is typed by Rust as a pointer to a generic pointer,
+//! and code compiled separately, such as a non-`move` closure body, reads the
+//! slot through it. Such a slot holds the generic form of the pointer; LLVM's
+//! address-space inference can still recover the concrete space after
+//! inlining.
 
 use super::facts;
 use super::facts::self_ty_is_shared_array;
@@ -505,6 +512,8 @@ impl SlotAddrSpaceMap {
     /// classifies the RHS, and merges observations into the destination
     /// local's state. Unclassified pointer writes contribute the pointer's
     /// declared lowering; only temporarily unresolved copy chains are skipped.
+    /// Locals whose slot is borrowed start at their declared lowering, so a
+    /// concrete write demotes them to generic instead of narrowing them.
     ///
     /// Convergence: each local can transition at most
     /// `Uninit → Known(n) → Generic` (two steps). Propagation chains
@@ -531,6 +540,19 @@ impl SlotAddrSpaceMap {
         {
             if let Some(address_space) = *declared {
                 *class = SlotAddrSpace::Known(address_space);
+            }
+        }
+
+        // `&local` and `&raw local` hand out the slot itself, typed by Rust
+        // as a pointer to the declared lowering. Code compiled separately
+        // reads and writes through it with that type (a non-`move` closure
+        // capture is the common case), so narrowing the slot would leave a
+        // generic `&*mut T` pointing at a stored `addrspace(3)` pointer. The
+        // declared lowering also covers writes made through the borrow, which
+        // the scan below cannot see
+        for local in address_taken_locals(body, reachable) {
+            if let Some(Some(address_space)) = declared_addr_spaces.get(local) {
+                merge_into(&mut classes, local, SlotAddrSpace::Known(*address_space));
             }
         }
 
@@ -606,6 +628,29 @@ impl SlotAddrSpaceMap {
             SlotAddrSpace::Generic => address_space::GENERIC,
         }
     }
+}
+
+/// Locals whose own slot is borrowed by a reachable `&local` / `&raw local`.
+///
+/// A borrow whose place starts with `Deref` reborrows the pointee and leaves
+/// the slot private, so it does not count.
+fn address_taken_locals(
+    body: &mir::Body,
+    reachable: &std::collections::BTreeSet<usize>,
+) -> std::collections::BTreeSet<mir::Local> {
+    reachable
+        .iter()
+        .flat_map(|&block_idx| &body.blocks[block_idx].statements)
+        .filter_map(|stmt| match &stmt.kind {
+            mir::StatementKind::Assign(
+                _,
+                mir::Rvalue::Ref(_, _, place) | mir::Rvalue::AddressOf(_, place),
+            ) if !matches!(place.projection.first(), Some(mir::ProjectionElem::Deref)) => {
+                Some(place.local)
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Turn a [`WriteClass`] into a [`SlotAddrSpace`] observation. An unknown
