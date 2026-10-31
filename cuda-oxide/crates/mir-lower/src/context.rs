@@ -52,12 +52,13 @@ pub(crate) fn lowering_options(ctx: &Context) -> LoweringOptions {
 /// Name for one generated module-scope global of a lowering-owned family
 /// (`__shared_mem`, `__device_global`, `__dynamic_smem`).
 ///
-/// `suffix` is what makes the name unique within one module: the per-module
-/// counter for the counter-named families, the owning function's symbol for
-/// the dynamic shared-memory pool. But every module starts its counters at
-/// zero and a helper shared across crates keeps its owner symbol, so two
-/// crates' PTX can define the same name — and `load_all_ptx_bundles_merged`
-/// textually concatenates the bundles, where the duplicate definition fails
+/// `suffix` is what makes the name unique within one module: the hash of the
+/// global's key (or, for a keyless shared allocation, a per-module counter),
+/// the owning function's symbol for the dynamic shared-memory pool. But a
+/// static from a shared dependency hashes the same in every crate, counters
+/// restart at zero, and a helper shared across crates keeps its owner symbol,
+/// so two crates' PTX can define the same name — and
+/// `load_all_ptx_bundles_merged` textually concatenates the bundles, where the duplicate definition fails
 /// driver JIT compilation, or (for the dynamic pool's duplicate extern
 /// declarations) silently keeps whichever alignment came first (#1277).
 ///
