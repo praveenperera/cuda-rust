@@ -311,7 +311,7 @@ fn convert_extract_union_field(
     }
 
     let storage_ty = build_union_storage_type(ctx, &union_ty).map_err(anyhow_to_pliron)?;
-    let ptr = spill_enum_value(ctx, rewriter, union_value, storage_ty, union_ty.abi_align());
+    let ptr = spill_enum_value(ctx, rewriter, union_value, storage_ty, union_ty.abi_align())?;
     let field_storage_ty =
         union_field_storage_type(ctx, field_llvm_ty).map_err(anyhow_to_pliron)?;
     let load = llvm::LoadOp::new(ctx, ptr, field_storage_ty);
@@ -349,7 +349,7 @@ fn convert_insert_union_field(
     }
 
     let storage_ty = build_union_storage_type(ctx, &union_ty).map_err(anyhow_to_pliron)?;
-    let ptr = spill_enum_value(ctx, rewriter, union_value, storage_ty, union_ty.abi_align());
+    let ptr = spill_enum_value(ctx, rewriter, union_value, storage_ty, union_ty.abi_align())?;
     let field_storage_ty =
         union_field_storage_type(ctx, field_llvm_ty).map_err(anyhow_to_pliron)?;
     let stored_value = coerce_target_stable_value(

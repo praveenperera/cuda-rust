@@ -84,6 +84,15 @@ For each `MirFuncOp`, `convert_func` (in `lowering.rs`):
 | `aggregate`    | Struct/tuple/array/enum extract, insert, construct, field/element addr                                         |
 | `call`         | `mir.call` (function calls with arg flattening)                                                                |
 
+Converters that need a stack slot (`mir.alloca`, `mir.ref`, a transmute
+through memory, a dynamic array index, an enum payload spill, a libdevice
+out-parameter) get it from `entry_alloca`, which puts the `alloca` in the
+function's entry block and leaves its initialization at the use site. LLVM
+treats any other alloca as dynamic: SROA cannot promote it, and it blocks
+ordinary inlining. The one exception is a `mir.ref` inside a loop: its
+reference can outlive the op, so it keeps a fresh use-site slot per
+execution.
+
 ### Type Converter (`convert/types/`)
 
 | `dialect-mir` Type   | LLVM dialect Type                                   |

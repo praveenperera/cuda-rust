@@ -167,7 +167,7 @@ pub(crate) fn convert_construct_enum(
     // each remaining payload at its byte position, and load the finished
     // enum back as the result.
     let abi_align = enum_ty.abi_align();
-    let slot_ptr = spill_enum_value(ctx, rewriter, current_struct, llvm_struct_ty, abi_align);
+    let slot_ptr = spill_enum_value(ctx, rewriter, current_struct, llvm_struct_ty, abi_align)?;
     for (flat, operand) in deferred {
         let field_ptr = byte_offset_gep(ctx, rewriter, slot_ptr, slot_map.field_offsets[flat]);
         // `bool` is an LLVM i1 as a value but occupies one full byte in
@@ -526,7 +526,7 @@ pub(crate) fn convert_enum_payload(
         }
         None => {
             let slot_ptr =
-                spill_enum_value(ctx, rewriter, enum_val, slot_map.llvm_struct_ty, abi_align);
+                spill_enum_value(ctx, rewriter, enum_val, slot_map.llvm_struct_ty, abi_align)?;
             let field_ptr = byte_offset_gep(ctx, rewriter, slot_ptr, slot_map.field_offsets[flat]);
             let semantic_ty = slot_map.field_llvm_types[flat];
             let storage_ty =

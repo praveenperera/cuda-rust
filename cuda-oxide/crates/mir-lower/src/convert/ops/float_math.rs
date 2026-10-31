@@ -5,6 +5,7 @@
 
 //! Floating-point math intrinsic lowering: `dialect-mir` placeholders to LLVM dialect and libdevice.
 
+use crate::convert::ops::entry_alloca::emit_entry_alloca;
 use crate::convert::types::{StructLayoutInfo, build_struct_slot_map, convert_type};
 use crate::helpers;
 use dialect_mir::rust_intrinsics::{self, RustFloatMathIntrinsic, RustFloatMathLowering};
@@ -18,9 +19,8 @@ use pliron::builtin::op_interfaces::CallOpCallable;
 use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::dialect_conversion::DialectConversionRewriter;
-use pliron::irbuild::inserter::{Inserter, OpInsertionPoint};
+use pliron::irbuild::inserter::Inserter;
 use pliron::irbuild::rewriter::Rewriter;
-use pliron::linked_list::ContainsLinkedList;
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::result::Result;
@@ -407,42 +407,12 @@ fn emit_libdevice_out_param_call(
             "libdevice out-parameter call has no parent block"
         )
     })?;
-    let parent = helpers::get_parent_func(ctx, block).map_err(anyhow_to_pliron)?;
-    let entry = parent
-        .deref(ctx)
-        .get_region(0)
-        .deref(ctx)
-        .iter(ctx)
-        .next()
-        .ok_or_else(|| {
-            pliron::input_error!(
-                loc.clone(),
-                "libdevice out-parameter call has no entry block"
-            )
-        })?;
-    let first = entry.deref(ctx).iter(ctx).next().ok_or_else(|| {
-        pliron::input_error!(
-            loc.clone(),
-            "libdevice out-parameter call has an empty entry block"
-        )
-    })?;
-    // A call inside a loop must reuse a static slot, rather than allocate
-    // additional stack storage on every iteration. Its size constant must
-    // dominate it too; initialization stays at the actual call site.
-    let one_attr = IntegerAttr::new(
-        IntegerType::get(ctx, 32, Signedness::Signless),
-        APInt::from_u64(1, NonZeroUsize::new(32).unwrap()),
-    );
-    let one = llvm::ConstantOp::new(ctx, Box::new(one_attr));
-    let saved_ip = rewriter.get_insertion_point();
-    rewriter.set_insertion_point(OpInsertionPoint::BeforeOperation(first));
-    rewriter.insert_operation(ctx, one.get_operation());
+    // a call inside a loop must reuse a static slot, rather than allocate
+    // additional stack storage on every iteration; initialization stays at
+    // the actual call site
     let out_ty = initial_out.get_type(ctx);
-    let one_value = one.get_operation().deref(ctx).get_result(0);
-    let slot = llvm::AllocaOp::new(ctx, out_ty, one_value, 0);
-    rewriter.insert_operation(ctx, slot.get_operation());
-    rewriter.set_insertion_point(saved_ip);
-    let ptr = slot.get_operation().deref(ctx).get_result(0);
+    let slot = emit_entry_alloca(ctx, rewriter, out_ty, None)?;
+    let ptr = slot.deref(ctx).get_result(0);
     let initialize = llvm::StoreOp::new(ctx, initial_out, ptr);
     rewriter.insert_operation(ctx, initialize.get_operation());
     let mut call_args = args.to_vec();

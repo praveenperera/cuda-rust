@@ -10,6 +10,7 @@ use super::common::{
     pointer_proved_alignment, value_abi_align, value_mir_type,
 };
 use super::debug::copy_debug_local_variable;
+use crate::convert::ops::entry_alloca::{emit_entry_alloca, emit_ref_slot};
 use crate::convert::target_stable_storage::coerce_target_stable_value;
 use crate::convert::types::{convert_type, mir_type_abi_align};
 use crate::packed_shared_local_storage::carrier_storage_type;
@@ -17,7 +18,6 @@ use dialect_mir::types::MirPtrType;
 use llvm_export::attributes::GepNoWrapFlags;
 use llvm_export::op_interfaces::VolatilityOpInterface;
 use llvm_export::ops as llvm;
-use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::dialect_conversion::{DialectConversionRewriter, OperandsInfo};
 use pliron::irbuild::inserter::Inserter;
@@ -194,24 +194,13 @@ pub(crate) fn convert_alloca(
         None => convert_type(ctx, mir_pointee).map_err(anyhow_to_pliron)?,
     };
 
-    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
-    let one_apint =
-        pliron::utils::apint::APInt::from_i64(1, std::num::NonZeroUsize::new(32).unwrap());
-    let one_attr = pliron::builtin::attributes::IntegerAttr::new(i32_ty, one_apint);
-    let one_const = llvm::ConstantOp::new(ctx, Box::new(one_attr));
-    rewriter.insert_operation(ctx, one_const.get_operation());
-    let one_val = one_const.get_operation().deref(ctx).get_result(0);
-
-    let alloca = llvm::AllocaOp::new(ctx, llvm_pointee, one_val, 0);
     // The allocated type's ABI alignment comes from this op's own result
     // pointee, which is still the MIR type at rewrite time.
-    if let Some(align) = mir_type_abi_align(ctx, mir_pointee) {
-        llvm_export::ops::set_op_alignment(ctx, alloca.get_operation(), align as u32);
-    }
-    copy_debug_local_variable(ctx, op, alloca.get_operation());
-    copy_local_memory_provenance(ctx, op, alloca.get_operation());
-    rewriter.insert_operation(ctx, alloca.get_operation());
-    rewriter.replace_operation(ctx, op, alloca.get_operation());
+    let align = mir_type_abi_align(ctx, mir_pointee).map(|align| align as u32);
+    let alloca = emit_entry_alloca(ctx, rewriter, llvm_pointee, align)?;
+    copy_debug_local_variable(ctx, op, alloca);
+    copy_local_memory_provenance(ctx, op, alloca);
+    rewriter.replace_operation(ctx, op, alloca);
 
     Ok(())
 }
@@ -222,6 +211,11 @@ pub(crate) fn convert_alloca(
 /// addresses, so we must place the value in memory to obtain a pointer.
 /// This applies to all types: scalars (e.g. `&factor` where factor is `u32`),
 /// aggregates (e.g. `&closure_env`), and pointers (e.g. `&&T`).
+///
+/// The store stays at the use site. The slot goes to the entry block unless
+/// the op sits in a loop, where a reference from an earlier iteration can
+/// still be live and each execution needs its own storage; see
+/// [`emit_ref_slot`].
 pub(crate) fn convert_ref(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -232,23 +226,11 @@ pub(crate) fn convert_ref(
     let operand_ty = operand.get_type(ctx);
     let abi_align = value_abi_align(ctx, operands_info, operand);
 
-    let i32_ty = IntegerType::get(ctx, 32, Signedness::Signless);
-    let one_apint =
-        pliron::utils::apint::APInt::from_i64(1, std::num::NonZeroUsize::new(32).unwrap());
-    let one_attr = pliron::builtin::attributes::IntegerAttr::new(i32_ty, one_apint);
-    let one_const = llvm::ConstantOp::new(ctx, Box::new(one_attr));
-    rewriter.insert_operation(ctx, one_const.get_operation());
-    let one_val = one_const.get_operation().deref(ctx).get_result(0);
-
-    let alloca = llvm::AllocaOp::new(ctx, operand_ty, one_val, 0);
     // Honour the referent's repr(align(N)) ABI alignment. Without this, the
     // synthesised alloca would be under-aligned relative to any loads/stores
     // that claim the struct's true alignment.
-    if let Some(align) = abi_align {
-        llvm_export::ops::set_op_alignment(ctx, alloca.get_operation(), align as u32);
-    }
-    rewriter.insert_operation(ctx, alloca.get_operation());
-    let alloca_ptr = alloca.get_operation().deref(ctx).get_result(0);
+    let alloca = emit_ref_slot(ctx, rewriter, operand_ty, abi_align.map(|a| a as u32))?;
+    let alloca_ptr = alloca.deref(ctx).get_result(0);
 
     let store = llvm::StoreOp::new(ctx, operand, alloca_ptr);
     if let Some(align) = abi_align {

@@ -4,6 +4,7 @@
  */
 
 use super::common::anyhow_to_pliron;
+use crate::convert::ops::entry_alloca::emit_entry_alloca;
 use crate::convert::types::{convert_type, mir_type_abi_align};
 use dialect_mir::types::MirArrayType;
 use llvm_export::attributes::{GepNoWrapFlags, ICmpPredicateAttr};
@@ -31,7 +32,8 @@ use std::num::NonZeroUsize;
 /// becomes NVPTX local memory.
 ///
 /// Unbounded, oversized, or otherwise unsupported indices retain the existing
-/// alloca+store+GEP+load fallback.
+/// alloca+store+GEP+load fallback. Its slot sits in the entry block, so SROA
+/// can still promote it when the index later folds to a constant.
 pub(crate) fn convert_extract_array_element(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
@@ -138,21 +140,13 @@ pub(crate) fn convert_extract_array_element(
     let llvm_array_ty = llvm_export::types::ArrayType::get(ctx, llvm_element_ty, array_size);
     let abi_align = mir_type_abi_align(ctx, element_ty);
 
-    let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
-    let one_val = {
-        let one_apint = APInt::from_i64(1, NonZeroUsize::new(64).unwrap());
-        let one_attr = pliron::builtin::attributes::IntegerAttr::new(i64_ty, one_apint);
-        let const_op = llvm::ConstantOp::new(ctx, Box::new(one_attr));
-        rewriter.insert_operation(ctx, const_op.get_operation());
-        const_op.get_operation().deref(ctx).get_result(0)
-    };
-
-    let alloca_op = llvm::AllocaOp::new(ctx, llvm_array_ty.into(), one_val, 0);
-    rewriter.insert_operation(ctx, alloca_op.get_operation());
-    if let Some(align) = abi_align {
-        llvm_export::ops::set_op_alignment(ctx, alloca_op.get_operation(), align as u32);
-    }
-    let array_ptr = alloca_op.get_operation().deref(ctx).get_result(0);
+    let alloca = emit_entry_alloca(
+        ctx,
+        rewriter,
+        llvm_array_ty.into(),
+        abi_align.map(|align| align as u32),
+    )?;
+    let array_ptr = alloca.deref(ctx).get_result(0);
 
     let store_op = llvm::StoreOp::new(ctx, array_val, array_ptr);
     rewriter.insert_operation(ctx, store_op.get_operation());

@@ -52,6 +52,7 @@
 //! another aggregate participates, its already-physical LLVM bytes are copied
 //! through an exactly-sized, explicitly aligned stack slot.
 
+use crate::convert::ops::entry_alloca::emit_entry_alloca;
 use crate::convert::types::{
     convert_type, llvm_type_contains_pointer_in_address_space, llvm_type_is_byte_faithful,
     llvm_type_size_align,
@@ -923,27 +924,16 @@ fn emit_int_to_ptr(
     }
 }
 
-fn const_i64(
-    ctx: &mut Context,
-    rewriter: &mut DialectConversionRewriter,
-    n: i64,
-) -> pliron::value::Value {
-    let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
-    let apint = pliron::utils::apint::APInt::from_i64(n, std::num::NonZeroUsize::new(64).unwrap());
-    let attr = pliron::builtin::attributes::IntegerAttr::new(i64_ty, apint);
-    let c = llvm::ConstantOp::new(ctx, Box::new(attr));
-    rewriter.insert_operation(ctx, c.get_operation());
-    c.get_operation().deref(ctx).get_result(0)
-}
-
 /// Equal-size Transmute through memory: `alloca` a stack slot, `store` the
 /// source value into it, then `load` it back as the destination type.
 ///
 /// This is the only valid lowering when either side is an aggregate,
 /// because LLVM's `bitcast` is restricted to non-aggregate first-class
 /// types (an aggregate bitcast such as `bitcast [4 x i8] %v to i32` is
-/// rejected by `llc` with "invalid cast opcode"). The `opt -O2` middle
-/// end folds the round-trip away, so no real stack traffic survives.
+/// rejected by `llc` with "invalid cast opcode"). The slot sits in the
+/// function's entry block and only this store/load pair touches it, so one
+/// slot serves every execution, even in a loop, and the `opt -O2` middle
+/// end (SROA) folds the round-trip away: no real stack traffic survives.
 ///
 /// Guarded by a total-byte-size equality check so a size-mismatched
 /// transmute fails loudly at compile time instead of silently truncating
@@ -1037,11 +1027,8 @@ fn emit_transmute_via_memory(
     };
     let storage_ty = if source_is_i1 { byte_ty } else { val_ty };
 
-    let one = const_i64(ctx, rewriter, 1);
-    let alloca = llvm::AllocaOp::new(ctx, storage_ty, one, 0);
-    llvm_export::ops::set_op_alignment(ctx, alloca.get_operation(), align);
-    rewriter.insert_operation(ctx, alloca.get_operation());
-    let ptr = alloca.get_operation().deref(ctx).get_result(0);
+    let alloca = emit_entry_alloca(ctx, rewriter, storage_ty, Some(align))?;
+    let ptr = alloca.deref(ctx).get_result(0);
 
     let store = llvm::StoreOp::new(ctx, stored_value, ptr);
     llvm_export::ops::set_op_alignment(ctx, store.get_operation(), align);

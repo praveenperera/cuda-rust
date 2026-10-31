@@ -31,6 +31,10 @@
 //! - Use `rewriter.insert_operation` to emit new LLVM ops.
 //! - Use `rewriter.replace_operation` to map results and erase the MIR op.
 //! - Use `operands_info` to recover pre-conversion types when needed.
+//! - Create stack slots with `entry_alloca::emit_entry_alloca`, never at the
+//!   use site: LLVM only promotes and inlines static (entry-block) allocas.
+//!   A slot whose address can outlive the op, as for `mir.ref`, goes through
+//!   `entry_alloca::emit_ref_slot`, which keeps it per-execution in a loop.
 
 pub mod aggregate;
 pub mod arithmetic;
@@ -38,6 +42,7 @@ pub mod call;
 pub mod cast;
 pub mod constants;
 pub mod control_flow;
+pub(crate) mod entry_alloca;
 pub mod float_math;
 pub mod memory;
 

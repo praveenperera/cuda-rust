@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+use crate::convert::ops::entry_alloca::emit_entry_alloca;
 use llvm_export::attributes::GepNoWrapFlags;
 use llvm_export::ops as llvm;
 use pliron::builtin::types::{IntegerType, Signedness};
@@ -19,7 +20,7 @@ pub(super) fn anyhow_to_pliron(e: anyhow::Error) -> pliron::result::Error {
     pliron::input_error_noloc!("{e}")
 }
 
-/// Copy an enum value into a fresh stack slot and return the pointer.
+/// Copy an enum value into a stack slot and return the pointer.
 ///
 /// This is how we reach a payload field that has no struct slot of its
 /// own (its bytes are shared with a different-typed field of another
@@ -30,38 +31,25 @@ pub(super) fn anyhow_to_pliron(e: anyhow::Error) -> pliron::result::Error {
 /// type alone can look under-aligned: `{ i8, [7 x i8] }` says "align 1"
 /// to LLVM, while Rust may require 8.
 ///
-/// The alloca lands at the use site, same as
-/// [`convert_extract_array_element`](super::array_extract::convert_extract_array_element);
-/// the standard `opt -O2` run (SROA)
-/// removes it again. Hoisting these into the function's entry block is a
-/// known follow-up for the unoptimized (`CUDA_OXIDE_NO_OPT=1`) path.
+/// The slot lives in the function's entry block, so LLVM sees a static
+/// alloca that SROA can split and promote; the store stays at the use site.
 pub(super) fn spill_enum_value(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     enum_val: Value,
     llvm_struct_ty: TypeHandle,
     abi_align: u64,
-) -> Value {
-    let i64_ty = IntegerType::get(ctx, 64, Signedness::Signless);
-    let one_apint = APInt::from_i64(1, NonZeroUsize::new(64).unwrap());
-    let one_attr = pliron::builtin::attributes::IntegerAttr::new(i64_ty, one_apint);
-    let one_const = llvm::ConstantOp::new(ctx, Box::new(one_attr));
-    rewriter.insert_operation(ctx, one_const.get_operation());
-    let one_val = one_const.get_operation().deref(ctx).get_result(0);
-
-    let alloca_op = llvm::AllocaOp::new(ctx, llvm_struct_ty, one_val, 0);
-    rewriter.insert_operation(ctx, alloca_op.get_operation());
-    if abi_align > 0 {
-        llvm_export::ops::set_op_alignment(ctx, alloca_op.get_operation(), abi_align as u32);
-    }
-    let slot_ptr = alloca_op.get_operation().deref(ctx).get_result(0);
+) -> pliron::result::Result<Value> {
+    let align = (abi_align > 0).then_some(abi_align as u32);
+    let alloca = emit_entry_alloca(ctx, rewriter, llvm_struct_ty, align)?;
+    let slot_ptr = alloca.deref(ctx).get_result(0);
 
     let store_op = llvm::StoreOp::new(ctx, enum_val, slot_ptr);
     rewriter.insert_operation(ctx, store_op.get_operation());
-    if abi_align > 0 {
-        llvm_export::ops::set_op_alignment(ctx, store_op.get_operation(), abi_align as u32);
+    if let Some(align) = align {
+        llvm_export::ops::set_op_alignment(ctx, store_op.get_operation(), align);
     }
-    slot_ptr
+    Ok(slot_ptr)
 }
 
 /// Pointer to `base + offset` bytes (`getelementptr i8, ptr base, offset`).
