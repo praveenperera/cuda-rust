@@ -25,28 +25,35 @@
 //! let q = quads[i];
 //! ```
 //!
-//! # Alignment is necessary but not sufficient for a wide *load*
+//! # Reading every lane keeps the wide load
 //!
-//! Measured on sm_86, with the element type 16-byte aligned throughout, only the
-//! way the value is *consumed* changes the load:
+//! Measured on sm_86 and sm_120 with the default LLVM 23.1.1 `llc` and CUDA
+//! 13.2 `ptxas` (LLVM 21.1.8 gives the same loads), a kernel that consumes all
+//! four lanes of an aligned element keeps its 128-bit load:
 //!
 //! ```text
 //! how the element is used                     LDG          STG
 //! `*out = input[i]`, never decomposed         LDG.E.128    STG.E.128
-//! lanes read, whole value assembled+stored    LDG.E x4     STG.E.128
-//! lanes read, scalar stored                   LDG.E x4     STG.E
+//! lanes read, whole value assembled+stored    LDG.E.128    STG.E.128
+//! lanes read, scalar stored                   LDG.E.128    STG.E
+//! four adjacent `f32` of a flat `&[f32]`      LDG.E x4     STG.E
 //! ```
 //!
-//! Touching individual lanes lets the optimiser split the local apart, and it
-//! then loads the lanes separately no matter how the type is aligned. The store
-//! side has no such condition: it widens whenever a whole value is assembled.
+//! The first three rows read a 16-byte aligned [`F32x4`], from a `&[F32x4]`
+//! parameter or through an [`as_vectors`] view of a flat `&[f32]`; both give
+//! the same 128-bit load. The last row is the control: the same four values
+//! at the flat slice's 4-byte alignment load separately. A store is wide when
+//! the kernel stores a whole vector and narrow when it stores a scalar.
 //!
-//! So these types buy width on the paths that **move** data - staging global to
-//! shared memory, copying, packing - and not on paths that immediately do
-//! elementwise arithmetic. That is the same split CUTLASS and cuTile arrive at:
-//! wide loads feed shared memory, and compute reads from there. If a kernel
-//! needs both, stage through shared memory rather than expecting one loop to get
-//! a wide load and lane access at once.
+//! So a kernel that does elementwise arithmetic on all the lanes of a quad
+//! still gets one 16-byte load per quad from these types, without inline PTX
+//! and without staging through shared memory. Alignment is necessary, not
+//! sufficient: LLVM loads only the lanes the kernel uses, so reading lanes 0
+//! and 1 of an [`F32x4`] gives one 64-bit load and reading lanes 0 and 2 gives
+//! two scalar loads. The table records what the
+//! toolchain above generates, not a guarantee the types make; for a kernel
+//! whose bandwidth depends on the width, check its SASS with
+//! `cuobjdump -sass`.
 //!
 //! # Why the check nearly always passes
 //!
