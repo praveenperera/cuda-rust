@@ -20,12 +20,14 @@
 //! `const_generic_bound` is the same nest with every bound written `LANES / 16`
 //! for a const generic `LANES`.
 //! `isize_range_for` covers `a..b`, `(a..b).rev()`, and `#[unroll(4)]` on an
-//! `isize` counter.
+//! `isize` counter. `partial_option_body` is `#[unroll(4)]` on a loop whose
+//! body matches an `Option`.
 //! All are semantics-preserving; the host checks the sums.
 //!
 //! `verify-code-shape.sh` asserts that `nested_lane_range`,
 //! `const_generic_bound`, and `isize_range_for` have no local memory in the
-//! generated PTX. GPU-less CI runs it through
+//! generated PTX, and that the unroller, not LLVM, split
+//! `partial_option_body` into a main and a remainder loop. GPU-less CI runs it through
 //! `scripts/smoketest.sh --compile-only`.
 //!
 //! Run: cargo oxide run unroll_smoke
@@ -684,6 +686,24 @@ mod kernels {
         *folded = weighted.wrapping_add(base);
         *partial = sum;
     }
+
+    /// `#[unroll(4)]` on a range loop whose body matches an `Option`.
+    /// rustc lowers `unwrap_or`'s `match` with an `otherwise` arm that is
+    /// `unreachable`, which the unroller must not count as another loop exit.
+    /// The result is the sum of `input[..n]`, with indices past the end
+    /// reading 0.
+    #[kernel]
+    pub fn partial_option_body(input: &[u32], mut out: DisjointSlice<u32>, n: u32) {
+        let Some(out_elem) = out.get_mut(thread::index_1d()) else {
+            return;
+        };
+        let mut sum = 0u32;
+        #[unroll(4)]
+        for i in 0..n {
+            sum = sum.wrapping_add(input.get(i as usize).copied().unwrap_or(0));
+        }
+        *out_elem = sum;
+    }
 }
 
 fn main() {
@@ -894,6 +914,29 @@ fn main() {
 
         let signed_input: Vec<u32> = (0..64u32).map(|i| i * 7 + 1).collect();
         let d_signed_input = DeviceBuffer::from_host(&stream, &signed_input).unwrap();
+        // past the 64 inputs for `range_trip = 16`, so the `None` arm runs too
+        let option_trip = range_trip * 5;
+        let mut d_option = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+        // SAFETY: each thread writes its own element; `input.get` bounds the reads.
+        unsafe {
+            module.partial_option_body(
+                stream.as_ref(),
+                cfg,
+                &d_signed_input,
+                &mut d_option,
+                option_trip,
+            )
+        }
+        .expect("launch partial_option_body");
+        let want_option = signed_input
+            .iter()
+            .take(option_trip as usize)
+            .fold(0u32, |sum, &x| sum.wrapping_add(x));
+        assert_eq!(
+            d_option.to_host_vec(&stream).unwrap(),
+            vec![want_option; N],
+            "partial `0..{option_trip}` over `get(..).unwrap_or(0)`"
+        );
         let mut d_signed = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
         let mut d_signed_part = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
         // SAFETY: each thread writes its own element of the buffer; the kernel

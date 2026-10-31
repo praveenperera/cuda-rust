@@ -17,7 +17,7 @@ use common::{
     OffsetBound, RangeBound, RangeForLoop, RangeForShape, StepForm, counted_loop,
     counted_loop_from_step, early_exit_counted_loop, early_exit_with_direct_liveout, i32t, mir_ctx,
     multi_latch_counted_loop, multiple_exit_counted_loop, nested_counted_loop, offset_counted_loop,
-    range_for_loop, shared_bound_nested_loop, u32t,
+    range_for_loop, shared_bound_nested_loop, u32t, unreachable_arm_counted_loop,
 };
 use dialect_mir::ops::{
     MirAddOp, MirBitAndOp, MirCallOp, MirCheckedAddOp, MirCheckedSubOp, MirCondBranchOp,
@@ -482,6 +482,48 @@ fn partial_unroll_with_extra_exits_is_skipped() {
     assert_eq!(after.exit_blocks(&ctx, lp.region, id).len(), 3);
     assert_eq!(cond_branch_count(&ctx, lp.region), 3);
     assert_eq!(hint_count(&ctx, lp.region), 0, "the request was consumed");
+}
+
+/// A branch to a block that only reaches `mir.unreachable`, like the
+/// `otherwise` arm of rustc's `match` on an `Option`, is not a loop exit. A
+/// block that calls a panic handler first is, and still declines partial
+/// unrolling.
+#[test]
+fn partial_unroll_ignores_a_branch_to_unreachable() {
+    for panics in [false, true] {
+        let mut ctx = mir_ctx();
+        let lp = unreachable_arm_counted_loop(&mut ctx, 10, panics);
+
+        MirUnrollHintOp::new(&mut ctx, 4)
+            .get_operation()
+            .insert_at_front(lp.body, &ctx);
+        let mut analyses = AnalysisManager::default();
+        unroll_annotated_loops(lp.module, &mut ctx, &mut analyses).expect("unroll pass");
+
+        pliron::operation::verify_operation(lp.module, &ctx).expect("valid IR after the pass");
+        assert_eq!(hint_count(&ctx, lp.region), 0, "panics={panics}");
+        let blocks: Vec<_> = lp.region.deref(&ctx).iter(&ctx).collect();
+        if panics {
+            assert_eq!(loop_count(&ctx, lp.region), 1, "the source loop remains");
+            assert!(
+                blocks.contains(&lp.dead),
+                "the panic path is still reachable"
+            );
+        } else {
+            assert_eq!(
+                loop_count(&ctx, lp.region),
+                2,
+                "a main loop and the remainder loop"
+            );
+            assert!(
+                !blocks.contains(&lp.dead),
+                "the branch to `unreachable` was folded away"
+            );
+            let after = loop_info(&ctx, lp.region);
+            let id = after.innermost_loop(lp.header).expect("remainder loop");
+            assert_eq!(after.exiting_blocks(&ctx, lp.region, id), vec![lp.header]);
+        }
+    }
 }
 
 #[test]
