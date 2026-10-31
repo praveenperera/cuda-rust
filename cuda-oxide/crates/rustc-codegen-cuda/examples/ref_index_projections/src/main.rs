@@ -20,6 +20,7 @@
  *     outer.inner.tail[k]                                // nested DST tail + runtime index
  *     value.tail[k] = x                                  // DST tail element write
  *     &value.tail[k]                                     // DST tail element borrow
+ *     if let Flag::Value(ref b) = flags[k] { r = b; }    // bool enum payload borrow
  *
  * Each kernel writes the difference compute(1) - compute(0), with inputs
  * designed so the two slots differ: a dropped index reads slot 0 twice
@@ -131,6 +132,15 @@ pub struct NestedOuter<T: ?Sized> {
 pub struct NestedPaddedOuter<T: ?Sized> {
     pub marker: u32,
     pub inner: PaddedTail<T>,
+}
+
+/// Enum with a `bool` payload. `bool` is stored as an `i8` byte inside enum
+/// storage, so the address walker declines a shared borrow of the payload and
+/// the importer borrows a copy instead (issue #1698).
+#[derive(Copy, Clone)]
+pub enum Flag {
+    Value(bool),
+    Empty,
 }
 
 /// Out-of-line accessor pinning the `[Deref, Field(0), Deref, Index(k)]`
@@ -1002,6 +1012,30 @@ mod kernels {
             *slot = (*c1 as f32 - *c0 as f32) + (*r1 as f32 - *r0 as f32);
         }
     }
+
+    /// Issue #1698: a shared borrow of a `bool` enum payload that outlives
+    /// its `if let`. The walker emits `flags[k]`'s element address before it
+    /// declines the payload, and must erase that before the value-copy
+    /// fallback, or the leftover ops land after the block's `goto` and the
+    /// kernel fails verification. The flag is true, so the result is +5.
+    #[kernel]
+    pub fn test_bool_payload_borrow(input: &[[f32; 2]], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= input.len() {
+            return;
+        }
+        let flags = [Flag::Value(input[i][1] > input[i][0]), Flag::Empty];
+        // Runtime index: input[0][0] == 0.0, so k == 0 at runtime.
+        let k = (input[0][0] as usize) & 1;
+        let mut r: &bool = &false;
+        if let Flag::Value(ref b) = flags[k] {
+            r = b;
+        }
+        if let Some(slot) = out.get_mut(idx) {
+            *slot = if *r { input[i][1] - input[i][0] } else { 0.0 };
+        }
+    }
 }
 
 const N: usize = 4;
@@ -1246,6 +1280,10 @@ fn main() {
     all_pass &= run_and_report("test_slice_tail_borrow_padded", &stream, |s, cfg, i, o| {
         // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
         unsafe { module.test_slice_tail_borrow_padded(s, cfg, i, o) }.expect("launch")
+    });
+    all_pass &= run_and_report("test_bool_payload_borrow", &stream, |s, cfg, i, o| {
+        // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+        unsafe { module.test_bool_payload_borrow(s, cfg, i, o) }.expect("launch")
     });
 
     if all_pass {

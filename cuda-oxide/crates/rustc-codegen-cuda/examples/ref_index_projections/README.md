@@ -12,7 +12,7 @@ which later optimisation could then fold into a single path.
 
 ## What the example does
 
-`src/main.rs` contains **32 kernels in four groups**. The first group's
+`src/main.rs` contains **33 kernels in five groups**. The first group's
 **14 variants** bisect the trigger conditions:
 
 | #  | Variant                              | Purpose                                        |
@@ -67,11 +67,26 @@ plus **6 DST slice-tail address regression kernels** for issue #881:
 | 31 | `test_slice_tail_write_padded`           | Padded `[u16]` tail, constant + runtime writes      |
 | 32 | `test_slice_tail_borrow_padded`          | Padded `[u16]` tail, constant + runtime borrows     |
 
+plus **1 enum-payload borrow regression kernel** for issue #1698:
+
+| #  | Variant                     | Shape pinned                                                   |
+|:---|:----------------------------|:---------------------------------------------------------------|
+| 33 | `test_bool_payload_borrow`  | `if let Flag::Value(ref b) = flags[k] { r = b; }`, `r` read after |
+
 Each kernel writes a difference (`r1 - r0`, or original-local readback for
 the write-through variants) for inputs chosen so a correct implementation
 must produce `+5.0` for every element. The harness prints `PASS` per kernel,
 tracks failures, prints a final `SUCCESS` marker when every kernel passes,
 and exits non-zero if any kernel reports a wrong diff.
+
+`test_bool_payload_borrow` borrows a `bool` enum payload and keeps the
+reference past the `if let`. `bool` is stored as an `i8` byte in enum storage,
+so the address walker declines to address the payload after it has already
+emitted `flags[k]`'s element address, and the importer borrows a copy instead.
+Before the fix those abandoned ops stayed in the block, landed after its
+`goto`, and the kernel failed verification ("has a terminator that is not the
+last operation in the block"). The flag is true for every thread, so the
+kernel reports `+5.0`.
 
 The direct slice-value regressions construct a `SliceTail<[f32; 2]>` and
 unsize it to `&SliceTail<[f32]>`. Deref of the fat struct reference must
@@ -155,7 +170,7 @@ the fix, the same MIR lowers to
 %v9 = load float, ptr %v8                                              ; correct
 ```
 
-and all 32 kernels report `PASS` (the harness prints a final `SUCCESS` marker
+and all 33 kernels report `PASS` (the harness prints a final `SUCCESS` marker
 and exits non-zero if any kernel reports a wrong diff).
 
 Issue #880 exposes a separate value-walker gap after the direct DST-tail

@@ -22,6 +22,7 @@ use dialect_mir::ops::{
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
+use pliron::linked_list::{ContainsLinkedList, LinkedList};
 use pliron::location::Location;
 use pliron::op::Op;
 use pliron::operation::Operation;
@@ -49,6 +50,12 @@ use std::num::NonZeroUsize;
 /// copy are fine) or the construct must be rejected (mutable borrows / raw
 /// mut pointers: writes through a copy are silently lost).
 ///
+/// `Ok(None)` leaves the block as it was: the walk can give up after it has
+/// already emitted ops for a prefix of the chain (the slice load and element
+/// offset before an enum payload it declines to address), and those ops are
+/// erased. A caller's fallback inserts after the same `prev_op`, so leftover
+/// ops would otherwise drift past the block terminator it appends (#1698).
+///
 /// Also used by statement translation to compute the destination address
 /// of projected assignments (indexed `(*ptr)[i]` writes and 3+ element
 /// projection chains), where the same "walk the chain, then act through
@@ -67,7 +74,15 @@ pub(crate) fn translate_place_address(
     let Some(slot) = value_map.get_slot(place.local) else {
         return Ok(None);
     };
-    translate_place_addr_from_slot(
+
+    // the walk inserts a chain right after `prev_op` (or at the block front),
+    // so everything between there and the op that followed it is the walk's
+    let first_inserted = |ctx: &Context| match prev_op {
+        Some(prev) => prev.deref(ctx).get_next(),
+        None => block_ptr.deref(ctx).get_head(),
+    };
+    let boundary = first_inserted(ctx);
+    let walked = translate_place_addr_from_slot(
         ctx,
         body,
         value_map,
@@ -77,7 +92,24 @@ pub(crate) fn translate_place_address(
         block_ptr,
         prev_op,
         loc,
-    )
+    )?;
+    if walked.is_none() {
+        let mut abandoned = Vec::new();
+        let mut cursor = first_inserted(ctx);
+        while let Some(op) = cursor
+            && Some(op) != boundary
+        {
+            abandoned.push(op);
+            cursor = op.deref(ctx).get_next();
+        }
+
+        // users come after their operands in the chain
+        for op in abandoned.into_iter().rev() {
+            Operation::erase(op, ctx);
+        }
+    }
+
+    Ok(walked)
 }
 
 /// Whether an enum payload's SEMANTIC type needs canonical-storage coercion
