@@ -58,5 +58,12 @@ for name in ("partial_option_body", "partial_block_stride"):
     if pragmas != 2:
         sys.exit(f"error: {name} has {pragmas} nounroll loops, expected the unroller's 2")
     print(f"{name}: main and remainder loop PASS")
+
+# `max_ops = 8` is too small for four copies, so the unroller must not split
+# `partial_low_budget`; LLVM may still split it once on its own
+pragmas = entry_body("partial_low_budget").count('.pragma "nounroll";')
+if pragmas >= 2:
+    sys.exit(f"error: partial_low_budget has {pragmas} nounroll loops; max_ops = 8 was ignored")
+print("partial_low_budget: budget respected PASS")
 print("unroll_smoke PTX shape: PASS")
 PY

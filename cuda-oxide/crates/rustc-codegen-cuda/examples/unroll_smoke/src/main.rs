@@ -22,14 +22,15 @@
 //! `isize_range_for` covers `a..b`, `(a..b).rev()`, and `#[unroll(4)]` on an
 //! `isize` counter. `partial_option_body` is `#[unroll(4)]` on a loop whose
 //! body matches an `Option`, and `partial_block_stride` on a loop that starts
-//! at the thread index and steps by the block size.
+//! at the thread index and steps by the block size. `partial_low_budget` is
+//! that loop with `max_ops = 8`, too small a budget for four copies.
 //! All are semantics-preserving; the host checks the sums.
 //!
 //! `verify-code-shape.sh` asserts that `nested_lane_range`,
 //! `const_generic_bound`, and `isize_range_for` have no local memory in the
-//! generated PTX, and that the unroller, not LLVM, split
+//! generated PTX, that the unroller, not LLVM, split
 //! `partial_option_body` and `partial_block_stride` into a main and a
-//! remainder loop. GPU-less CI runs it through
+//! remainder loop, and that it left `partial_low_budget` alone. GPU-less CI runs it through
 //! `scripts/smoketest.sh --compile-only`.
 //!
 //! Run: cargo oxide run unroll_smoke
@@ -724,6 +725,25 @@ mod kernels {
         }
         *out_elem = sum;
     }
+
+    /// The same block-stride loop with `max_ops = 8`, below the operations
+    /// four body copies need, so the unroller declines it and says so. This
+    /// checks the per-loop budget reaches the pass; raising it works the same
+    /// way, but only a loop over the default budget would show it.
+    #[kernel]
+    pub fn partial_low_budget(input: &[u32], mut out: DisjointSlice<u32>, n: u32) {
+        let Some(out_elem) = out.get_mut(thread::index_1d()) else {
+            return;
+        };
+        let mut sum = 0u32;
+        let mut i = thread::threadIdx_x();
+        #[unroll(4, max_ops = 8)]
+        while i < n {
+            sum = sum.wrapping_add(input[i as usize]);
+            i += thread::blockDim_x();
+        }
+        *out_elem = sum;
+    }
 }
 
 fn main() {
@@ -985,6 +1005,23 @@ fn main() {
             d_stride.to_host_vec(&stream).unwrap(),
             want_stride,
             "block-stride `{stride_n}` elements"
+        );
+        let mut d_low_budget = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+        // SAFETY: each thread writes its own element; reads stay below `stride_n`.
+        unsafe {
+            module.partial_low_budget(
+                stream.as_ref(),
+                cfg,
+                &d_signed_input,
+                &mut d_low_budget,
+                stride_n,
+            )
+        }
+        .expect("launch partial_low_budget");
+        assert_eq!(
+            d_low_budget.to_host_vec(&stream).unwrap(),
+            want_stride,
+            "block-stride `{stride_n}` elements under `max_ops = 8`"
         );
         let mut d_signed = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
         let mut d_signed_part = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
