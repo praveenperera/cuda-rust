@@ -509,6 +509,136 @@ fn offset_loop(
     }
 }
 
+/// Where a [`runtime_step_loop`] gets the amount it adds to its counter.
+#[derive(Debug, Clone, Copy)]
+pub enum LoopStep {
+    /// The `step` argument, defined before the loop.
+    Param,
+    /// An integer cast of the `step` argument, computed again on every
+    /// iteration, as `i += blockDim_x() as usize` reads its register again.
+    /// The argument has the counter's width and the other signedness.
+    CastInLoop,
+    /// A constant, so only the starting value is unknown.
+    Const(i128),
+}
+
+/// Build `fn(start, n, step) { acc = 0; i = start; while i <pred> n { acc +=
+/// i; i += step } acc }`, a counter whose start and step are only known at
+/// runtime, in the shape mem2reg leaves it:
+///
+/// ```text
+///   preheader(start, n, step): acc0=0;               goto header(acc0, start)
+///   header(acc, i):            t = not(i <pred> n);   cond_br t [exit(acc), latch]
+///   latch:                     acc1=acc+i; i1=i+s;    goto header(acc1, i1)
+///   exit(result):              return result
+/// ```
+///
+/// `s` comes from `step_source`. All values have type `ty`, except a
+/// [`LoopStep::CastInLoop`] `step` argument.
+pub fn runtime_step_loop(
+    ctx: &mut Context,
+    ty: TypedHandle<IntegerType>,
+    pred: CmpPred,
+    step_source: LoopStep,
+) -> CountedLoop {
+    let i1 = i1(ctx);
+    let step_ty = match step_source {
+        LoopStep::CastInLoop => {
+            let width = ty.deref(ctx).width();
+            let other = if ty.deref(ctx).signedness() == Signedness::Signed {
+                Signedness::Unsigned
+            } else {
+                Signedness::Signed
+            };
+            IntegerType::get(ctx, width, other)
+        }
+        LoopStep::Param | LoopStep::Const(_) => ty,
+    };
+    let inputs: Vec<TypeHandle> = vec![ty.into(), ty.into(), step_ty.into()];
+    let (module, region) = func(ctx, inputs.clone(), vec![ty.into()]);
+
+    let preheader = block(ctx, region, inputs);
+    let header = block(ctx, region, vec![ty.into(), ty.into()]); // (acc, i)
+    let latch = block(ctx, region, vec![]);
+    let exit = block(ctx, region, vec![ty.into()]);
+
+    let start = preheader.deref(ctx).get_argument(0);
+    let n = preheader.deref(ctx).get_argument(1);
+    let step_arg = preheader.deref(ctx).get_argument(2);
+    let acc0 = iconst_i128(ctx, preheader, ty, 0);
+    goto(ctx, preheader, header, vec![acc0, start]);
+
+    let acc = header.deref(ctx).get_argument(0);
+    let i = header.deref(ctx).get_argument(1);
+    let info = match pred {
+        CmpPred::Lt => MirLtOp::get_concrete_op_info(),
+        CmpPred::Le => MirLeOp::get_concrete_op_info(),
+        CmpPred::Gt => MirGtOp::get_concrete_op_info(),
+        CmpPred::Ge => MirGeOp::get_concrete_op_info(),
+    };
+    let keep_going = op2!(ctx, header, info, i1.into(), i, n);
+    let done = {
+        let op = Operation::new(
+            ctx,
+            MirNotOp::get_concrete_op_info(),
+            vec![i1.into()],
+            vec![keep_going],
+            vec![],
+            0,
+        );
+        op.insert_at_back(header, ctx);
+        op.deref(ctx).get_result(0)
+    };
+    cond_br_args(ctx, header, done, exit, vec![acc], latch, vec![]);
+
+    let acc1 = op2!(
+        ctx,
+        latch,
+        MirAddOp::get_concrete_op_info(),
+        ty.into(),
+        acc,
+        i
+    );
+    let step = match step_source {
+        LoopStep::Param => step_arg,
+        LoopStep::CastInLoop => {
+            let op = Operation::new(
+                ctx,
+                MirCastOp::get_concrete_op_info(),
+                vec![ty.into()],
+                vec![step_arg],
+                vec![],
+                0,
+            );
+            MirCastOp::new(op).set_attr_cast_kind(ctx, MirCastKindAttr::IntToInt);
+            op.insert_at_back(latch, ctx);
+            op.deref(ctx).get_result(0)
+        }
+        LoopStep::Const(step) => iconst_i128(ctx, latch, ty, step),
+    };
+    let inext = op2!(
+        ctx,
+        latch,
+        MirAddOp::get_concrete_op_info(),
+        ty.into(),
+        i,
+        step
+    );
+    goto(ctx, latch, header, vec![acc1, inext]);
+
+    let result = exit.deref(ctx).get_argument(0);
+    ret_values(ctx, exit, vec![result]);
+
+    CountedLoop {
+        module,
+        region,
+        preheader,
+        header,
+        latch,
+        exit,
+    }
+}
+
 /// A built nested counted loop (outer `while i < n` containing inner
 /// `while j < m`) and the blocks worth asserting on.
 pub struct NestedLoop {

@@ -50,12 +50,13 @@ for name in names:
     print(f"{name}: no local memory PASS")
 
 # A partial `#[unroll(N)]` marks both its main and its remainder loop
-# `nounroll`. LLVM runtime-unrolls this loop by itself when the request is
-# declined, and then marks only its own remainder loop.
-name = "partial_option_body"
-pragmas = entry_body(name).count('.pragma "nounroll";')
-if pragmas != 2:
-    sys.exit(f"error: {name} has {pragmas} nounroll loops, expected the unroller's 2")
-print(f"{name}: main and remainder loop PASS")
+# `nounroll`. When the request is declined, LLVM runtime-unrolls
+# `partial_option_body` by itself and marks only its own remainder loop, and
+# leaves `partial_block_stride` rolled and unmarked.
+for name in ("partial_option_body", "partial_block_stride"):
+    pragmas = entry_body(name).count('.pragma "nounroll";')
+    if pragmas != 2:
+        sys.exit(f"error: {name} has {pragmas} nounroll loops, expected the unroller's 2")
+    print(f"{name}: main and remainder loop PASS")
 print("unroll_smoke PTX shape: PASS")
 PY

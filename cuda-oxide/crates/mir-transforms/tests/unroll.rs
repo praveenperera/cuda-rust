@@ -14,13 +14,14 @@
 mod common;
 
 use common::{
-    OffsetBound, RangeBound, RangeForLoop, RangeForShape, StepForm, counted_loop,
+    LoopStep, OffsetBound, RangeBound, RangeForLoop, RangeForShape, StepForm, counted_loop,
     counted_loop_from_step, early_exit_counted_loop, early_exit_with_direct_liveout, i32t, mir_ctx,
     multi_latch_counted_loop, multiple_exit_counted_loop, nested_counted_loop, offset_counted_loop,
-    range_for_loop, shared_bound_nested_loop, u32t, unreachable_arm_counted_loop,
+    range_for_loop, runtime_step_loop, shared_bound_nested_loop, u32t,
+    unreachable_arm_counted_loop,
 };
 use dialect_mir::ops::{
-    MirAddOp, MirBitAndOp, MirCallOp, MirCheckedAddOp, MirCheckedSubOp, MirCondBranchOp,
+    MirAddOp, MirBitAndOp, MirCallOp, MirCastOp, MirCheckedAddOp, MirCheckedSubOp, MirCondBranchOp,
     MirConstantOp, MirGeOp, MirGetDiscriminantOp, MirGtOp, MirLeOp, MirLtOp, MirNotOp, MirReturnOp,
     MirSubOp, MirUnrollHintOp,
 };
@@ -830,6 +831,9 @@ fn evaluate_integer(ctx: &Context, value: Value, inputs: &HashMap<Value, i128>) 
         let lhs = evaluate_integer(ctx, op.deref(ctx).get_operand(0), inputs);
         if Operation::get_op::<MirNotOp>(op, ctx).is_some() {
             !lhs
+        } else if Operation::get_op::<MirCastOp>(op, ctx).is_some() {
+            // an integer cast keeps the value; the result type wraps it below
+            lhs
         } else {
             let rhs = evaluate_integer(ctx, op.deref(ctx).get_operand(1), inputs);
             if Operation::get_op::<MirAddOp>(op, ctx).is_some() {
@@ -987,6 +991,98 @@ fn run_function(ctx: &Context, region: Ptr<Region>, args: &[i128]) -> i128 {
         block = term.deref(ctx).get_successor(taken);
     }
     panic!("the function did not return within 10,000 blocks");
+}
+
+/// The block-stride loop `i = start; while i < n { acc += i; i += step }`,
+/// with the start and the step only known at runtime, partially unrolls and
+/// returns what the source loop returns. Every 8-bit start, bound, and step
+/// below runs, including steps that wrap the counter or are negative, as a
+/// signed counter's `i += step` can be.
+#[test]
+fn partial_unroll_of_a_runtime_step_loop_matches_the_source_loop() {
+    for (signedness, _, max, bounds) in eight_bit_cases() {
+        for step_source in [LoopStep::Param, LoopStep::CastInLoop, LoopStep::Const(3)] {
+            for pred in [CmpPred::Lt, CmpPred::Le] {
+                for factor in [2, 4] {
+                    let mut ctx = mir_ctx();
+                    let ty = IntegerType::get(&ctx, 8, signedness);
+                    let lp = runtime_step_loop(&mut ctx, ty, pred, step_source);
+                    MirUnrollHintOp::new(&mut ctx, factor)
+                        .get_operation()
+                        .insert_at_front(lp.latch, &ctx);
+                    let mut analyses = AnalysisManager::default();
+                    unroll_annotated_loops(lp.module, &mut ctx, &mut analyses)
+                        .expect("unroll pass succeeds");
+                    pliron::operation::verify_operation(lp.module, &ctx)
+                        .expect("valid IR after the pass");
+                    let case =
+                        format!("{signedness:?}, {step_source:?}, {pred:?}, factor={factor}");
+                    assert_eq!(loop_count(&ctx, lp.region), 2, "{case}");
+
+                    let wrap = |value: i128| {
+                        let bits = value.rem_euclid(256);
+                        if signedness == Signedness::Signed && bits > max {
+                            bits - 256
+                        } else {
+                            bits
+                        }
+                    };
+                    let steps: Vec<i128> = match step_source {
+                        LoopStep::Const(step) => vec![step],
+                        // the cast argument has the other signedness; the loop
+                        // adds its bits, so any value covers the same steps
+                        LoopStep::Param | LoopStep::CastInLoop => vec![0, 1, 2, 3, 64, 127, -1, -2]
+                            .into_iter()
+                            .map(wrap)
+                            .collect(),
+                    };
+                    for &start in &bounds {
+                        for &n in &bounds {
+                            for &step in &steps {
+                                // the counter decides control flow alone, so
+                                // a loop that has not left after 256 trips
+                                // has revisited a counter and never leaves
+                                let (mut acc, mut i) = (0, start);
+                                let mut want = None;
+                                for _ in 0..=256 {
+                                    let keep_going = match pred {
+                                        CmpPred::Lt => i < n,
+                                        _ => i <= n,
+                                    };
+                                    if !keep_going {
+                                        want = Some(acc);
+                                        break;
+                                    }
+                                    acc = wrap(acc + i);
+                                    i = wrap(i + step);
+                                }
+                                let Some(want) = want else {
+                                    continue;
+                                };
+                                let step_arg = match step_source {
+                                    // the argument has the other signedness
+                                    LoopStep::CastInLoop => {
+                                        let bits = step.rem_euclid(256);
+                                        if signedness == Signedness::Unsigned && bits >= 128 {
+                                            bits - 256
+                                        } else {
+                                            bits
+                                        }
+                                    }
+                                    LoopStep::Param | LoopStep::Const(_) => step,
+                                };
+                                assert_eq!(
+                                    run_function(&ctx, lp.region, &[start, n, step_arg]),
+                                    want,
+                                    "{case}: start={start}, n={n}, step={step}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Plant an unroll hint (`factor` 0 = full) in a range `for` body and run the
