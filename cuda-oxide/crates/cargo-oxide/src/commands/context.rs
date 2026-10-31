@@ -28,7 +28,11 @@ pub struct OxideConfig {
 pub struct Context {
     /// Absolute path to the workspace root (contains top-level `Cargo.toml`).
     pub workspace_root: PathBuf,
-    /// Path to `crates/rustc-codegen-cuda` (backend source tree).
+    /// Path to `crates/rustc-codegen-cuda` (backend source tree) in workspace
+    /// mode. In standalone mode it is the project directory: the backend
+    /// source there is the dependency checkout `backend::standalone_backend`
+    /// resolves, which may not exist until it fetches, so never build this
+    /// path as the backend outside the workspace
     pub codegen_crate: PathBuf,
     /// Path to `crates/rustc-codegen-cuda/examples/`.
     pub examples_dir: PathBuf,

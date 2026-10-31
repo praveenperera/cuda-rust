@@ -5,6 +5,8 @@
 
 use crate::backend;
 use crate::backend_source;
+use std::ffi::OsStr;
+use std::path::Path;
 
 use super::*;
 
@@ -12,12 +14,101 @@ use super::*;
 // Setup command
 // =============================================================================
 
+/// How `cargo oxide setup` should behave for the current project mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupPlan {
+    /// Inside the monorepo: build the local backend source and publish it to
+    /// the shared cache.
+    BuildAndPublish,
+    /// Outside the monorepo: report the backend context resolution already
+    /// built or validated for this project's cuda-oxide dependency.
+    ReportResolved,
+}
+
+pub fn plan_setup(is_workspace: bool) -> SetupPlan {
+    if is_workspace {
+        SetupPlan::BuildAndPublish
+    } else {
+        SetupPlan::ReportResolved
+    }
+}
+
 /// Explicitly build (or rebuild) the codegen backend.
 ///
 /// Normally the backend is built automatically on every `run`/`build`/`pipeline`
 /// invocation. `setup` exists for first-time setup, CI, or after pulling new
 /// changes when you want to rebuild without running an example.
+///
+/// Outside the workspace the backend comes from the project's cuda-oxide
+/// dependency, which `resolve_context` builds or validates before `setup`
+/// runs, so `setup` only reports the result there
 pub fn setup(ctx: &Context) {
+    match plan_setup(ctx.is_workspace) {
+        SetupPlan::BuildAndPublish => build_and_publish(ctx),
+        SetupPlan::ReportResolved => report_resolved(ctx),
+    }
+}
+
+/// Outside the monorepo, `ctx.codegen_crate` is the user's project, not a
+/// backend source tree; building it compiles the user's crate and finds no
+/// backend artifact (#1688). The source is the project's cuda-oxide
+/// dependency, which `resolve_context` already built into the shared cache
+/// (in place for a path dependency) or found there with a matching commit.
+/// That backend is current by construction, so a second build would only
+/// repeat it; `update` is the explicit clear-and-rebuild. A pinned backend is
+/// the exception: discovery returns it as soon as the file exists, so setup
+/// can't vouch for it
+fn report_resolved(ctx: &Context) {
+    let env_pin = std::env::var_os("CUDA_OXIDE_BACKEND");
+    match backend_pin(
+        env_pin.as_deref(),
+        ctx.config.backend.as_deref(),
+        &ctx.backend_so,
+    ) {
+        Some(pin) => {
+            println!(
+                "Using the backend pinned by {pin}: {}",
+                ctx.backend_so.display()
+            );
+            println!("  setup neither builds nor checks a pinned backend. It must have been");
+            println!("  built from this project's cuda-oxide commit with the active Rust");
+            println!("  toolchain, or rustc fails to load it; unset the pin to have setup");
+            println!("  build it from the dependency.");
+        }
+        None => {
+            println!("✓ Backend is ready at {}", ctx.backend_so.display());
+            println!("  Built from this project's cuda-oxide dependency, or from cuda-oxide main");
+            println!("  when it has none. Run `cargo oxide update` to clear the shared cache and");
+            println!("  rebuild it.");
+        }
+    }
+    println!();
+    println!("You can now use:");
+    println!("  cargo oxide run");
+    println!("  cargo oxide build");
+}
+
+/// Names the pin that selected `selected`, if one did.
+///
+/// Compares against the backend discovery actually chose rather than testing
+/// whether a pin is set: `find_or_build_backend` warns about a
+/// `CUDA_OXIDE_BACKEND` that points at a missing file and falls back to
+/// auto-detection, so a set variable doesn't mean it was used
+pub fn backend_pin(
+    env_backend: Option<&OsStr>,
+    configured_backend: Option<&Path>,
+    selected: &Path,
+) -> Option<&'static str> {
+    if env_backend.is_some_and(|path| Path::new(path) == selected) {
+        return Some("CUDA_OXIDE_BACKEND");
+    }
+    if configured_backend == Some(selected) {
+        return Some("`.cargo/cuda-oxide.toml`");
+    }
+    None
+}
+
+fn build_and_publish(ctx: &Context) {
     println!("Building cuda-oxide codegen backend...");
     println!();
 

@@ -468,7 +468,11 @@ anyway).
 
 ### `cargo oxide setup`
 
-Explicitly builds (or rebuilds) the codegen backend. Normally this happens automatically on every `run`/`build`/`pipeline` command, but `setup` is useful after pulling new changes or for CI.
+Explicitly builds the codegen backend when it is missing or out of date. Normally this happens automatically on every `run`/`build`/`pipeline` command, but `setup` is useful after pulling new changes or for CI.
+
+Inside the cuda-oxide workspace, `setup` builds the local backend source and publishes it to the shared cache. In a project outside the workspace, `setup` makes sure the backend for the project's cuda-oxide dependency is built (see [Backend Discovery](#backend-discovery)) and prints its path; a cache that already matches the dependency is reused as is. To clear the shared cache and rebuild it anyway, run `cargo oxide update`.
+
+A backend pinned by `CUDA_OXIDE_BACKEND` or `.cargo/cuda-oxide.toml` is used as long as the file exists: `setup` reports the pin but neither builds nor checks it, and `update` doesn't replace it. Unset the pin to go back to the dependency's backend.
 
 ### `cargo oxide update [--force]`
 

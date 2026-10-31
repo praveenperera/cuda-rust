@@ -4415,6 +4415,37 @@ fn plan_update_selects_advise_setup_or_cache_refresh() {
     assert_eq!(plan_update(false, true), UpdatePlan::RefreshCache);
 }
 
+/// Outside the workspace `codegen_crate` is the user's project, so building
+/// it as the backend fails (#1688); `setup` must report the backend context
+/// resolution already built from the project's dependency instead
+#[test]
+fn plan_setup_builds_local_source_only_inside_the_workspace() {
+    assert_eq!(plan_setup(true), SetupPlan::BuildAndPublish);
+    assert_eq!(plan_setup(false), SetupPlan::ReportResolved);
+}
+
+#[test]
+fn backend_pin_names_only_the_pin_discovery_used() {
+    let cache = Path::new("/home/u/.cargo/cuda-oxide/librustc_codegen_cuda.so");
+    let pinned = Path::new("/opt/backend/librustc_codegen_cuda.so");
+    let configured = Path::new("/work/backend/librustc_codegen_cuda.so");
+
+    assert_eq!(
+        backend_pin(Some(pinned.as_os_str()), None, pinned),
+        Some("CUDA_OXIDE_BACKEND")
+    );
+    assert_eq!(
+        backend_pin(None, Some(configured), configured),
+        Some("`.cargo/cuda-oxide.toml`")
+    );
+    // a CUDA_OXIDE_BACKEND naming a missing file falls back to the cache
+    assert_eq!(
+        backend_pin(Some(Path::new("/missing.so").as_os_str()), None, cache),
+        None
+    );
+    assert_eq!(backend_pin(None, None, cache), None);
+}
+
 /// A `.cargo/cuda-oxide.toml` backend pin outranks the shared cache, so
 /// `update` must refuse just like it does for `CUDA_OXIDE_BACKEND`.
 #[test]
