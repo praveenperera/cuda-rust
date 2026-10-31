@@ -443,6 +443,16 @@ impl<'kernel> ThreadIndex32<'kernel> {
     pub fn get(&self) -> u32 {
         self.raw
     }
+
+    /// Host-test-only minting, like [`ThreadIndex::for_test`].
+    #[cfg(test)]
+    pub(crate) fn for_test(raw: u32) -> Self {
+        Self {
+            raw,
+            _kernel: PhantomData,
+            _not_send_sync: PhantomData,
+        }
+    }
 }
 
 impl fmt::Debug for ThreadIndex32<'_> {
@@ -489,6 +499,16 @@ impl<'kernel> ThreadCoord2D32<'kernel> {
     #[inline(always)]
     pub fn col(&self) -> u32 {
         self.packed as u32
+    }
+
+    /// Host-test-only minting, like [`ThreadIndex::for_test`].
+    #[cfg(test)]
+    pub(crate) fn for_test(row: u32, col: u32) -> Self {
+        Self {
+            packed: ((row as u64) << 32) | col as u64,
+            _kernel: PhantomData,
+            _not_send_sync: PhantomData,
+        }
     }
 }
 

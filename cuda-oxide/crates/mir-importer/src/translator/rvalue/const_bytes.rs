@@ -7,8 +7,9 @@
 
 use super::coerce::cast_struct_fields_to_expected_types;
 use super::const_alloc::{
-    translate_array_constant_from_alloc, translate_struct_constant_from_alloc,
-    translate_tuple_constant_from_alloc, validate_array_value_element_type,
+    relocation_offsets_overlapping_range, translate_array_constant_from_alloc,
+    translate_struct_constant_from_alloc, translate_tuple_constant_from_alloc,
+    validate_array_value_element_type,
 };
 use super::const_enum::{read_uint_from_bytes, translate_enum_constant_from_bytes};
 use super::promoted::constant_allocation;
@@ -1172,6 +1173,213 @@ fn translate_struct_constant_from_bytes(
     Ok((op.deref(ctx).get_result(0), Some(op)))
 }
 
+/// Build a top-level `DisjointSlice` constant from its allocation.
+///
+/// rustc folds a slice literal whose fields are all constants into one
+/// allocation. `DisjointSlice::empty()` becomes exactly that once inlined: a
+/// dangling address, a zero length and, for a runtime-width index space, a
+/// zero row width.
+pub(super) fn translate_disjoint_slice_constant(
+    ctx: &mut Context,
+    constant: &mir::ConstOperand,
+    rust_ty: &rustc_public::ty::Ty,
+    const_ty_ptr: TypeHandle,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
+    let Some(alloc) = constant_allocation(constant) else {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "DisjointSlice constant has no byte-backed allocation (constant kind: {:?})",
+                constant.const_.kind()
+            ))
+        );
+    };
+    translate_disjoint_slice_constant_from_alloc(
+        ctx,
+        alloc,
+        0,
+        rust_ty,
+        const_ty_ptr,
+        block_ptr,
+        prev_op,
+        loc,
+    )
+}
+
+/// Build a `DisjointSlice` constant that starts `absolute_byte_offset` bytes
+/// into `alloc`, either a whole slice constant or one field of a larger one.
+///
+/// A slice carrying provenance is rejected. No safe constructor produces a
+/// constant slice that points into an allocation, and its pointer bytes
+/// would be a relocation placeholder rather than an address.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn translate_disjoint_slice_constant_from_alloc(
+    ctx: &mut Context,
+    alloc: &rustc_public::ty::Allocation,
+    absolute_byte_offset: usize,
+    rust_ty: &rustc_public::ty::Ty,
+    const_ty_ptr: TypeHandle,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
+    let size = rust_type_layout_size(*rust_ty, loc.clone())?;
+    let end = absolute_byte_offset.saturating_add(size);
+    let Some(image) = alloc.bytes.get(absolute_byte_offset..end) else {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "DisjointSlice constant needs bytes {absolute_byte_offset}..{end}, but its \
+                 allocation has {}",
+                alloc.bytes.len()
+            ))
+        );
+    };
+    let pointer_width = rustc_public::target::MachineInfo::target_pointer_width().bytes();
+    if !relocation_offsets_overlapping_range(
+        &alloc.provenance.ptrs,
+        absolute_byte_offset,
+        end,
+        pointer_width,
+    )
+    .is_empty()
+    {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(
+                "DisjointSlice constant points into an allocation; only address-only \
+                 constants such as DisjointSlice::empty() are supported"
+            )
+        );
+    }
+    translate_disjoint_slice_constant_from_image(
+        ctx,
+        image,
+        rust_ty,
+        const_ty_ptr,
+        block_ptr,
+        prev_op,
+        loc,
+    )
+}
+
+/// Build a `DisjointSlice` constant from its memory image, one entry per byte
+/// with `None` for an uninitialized one.
+///
+/// Each runtime field is decoded from its own byte range at its rustc layout
+/// offset, so uninitialized padding between or after the fields (four bytes
+/// after the row width of a runtime-width slice on a 64-bit target) is never
+/// read, while an uninitialized byte inside a field is rejected. The fields
+/// are reassembled with `mir.construct_disjoint_slice`, the op a slice
+/// literal builds, so the result is indistinguishable from the unfolded
+/// literal.
+fn translate_disjoint_slice_constant_from_image(
+    ctx: &mut Context,
+    image: &[Option<u8>],
+    rust_ty: &rustc_public::ty::Ty,
+    const_ty_ptr: TypeHandle,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
+    use rustc_public::ty::{RigidTy, TyKind};
+
+    let (adt_def, substs) = match rust_ty.kind() {
+        TyKind::RigidTy(RigidTy::Adt(adt_def, substs)) => (adt_def, substs),
+        other => {
+            return input_err!(
+                loc,
+                TranslationErr::unsupported(format!(
+                    "Expected the DisjointSlice ADT for a slice constant, got {other:?}"
+                ))
+            );
+        }
+    };
+    let layout = rust_ty.layout().map_err(|e| {
+        input_error_noloc!(TranslationErr::unsupported(format!(
+            "Failed to query layout for DisjointSlice constant: {e:?}"
+        )))
+    })?;
+    let rustc_public::abi::FieldsShape::Arbitrary { offsets } = &layout.shape().fields else {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "DisjointSlice constant fields use unsupported shape {:?}",
+                layout.shape().fields
+            ))
+        );
+    };
+    let variant = adt_def.variants().into_iter().next().ok_or_else(|| {
+        input_error_noloc!(TranslationErr::unsupported(
+            "DisjointSlice ADT has no variants in metadata"
+        ))
+    })?;
+
+    // the marker fields and a `()` layout are zero-sized and dropped by
+    // `construct_disjoint_slice_aggregate`, so decode only fields with bytes
+    let mut field_values = Vec::new();
+    let mut current_prev_op = prev_op;
+    for (field, offset) in variant.fields().iter().zip(offsets) {
+        let field_rust_ty = field.ty_with_args(&substs);
+        let field_size = rust_type_layout_size(field_rust_ty, loc.clone())?;
+        if field_size == 0 {
+            continue;
+        }
+        let start = offset.bytes();
+        let Some(field_image) = image.get(start..start + field_size) else {
+            return input_err!(
+                loc,
+                TranslationErr::unsupported(format!(
+                    "DisjointSlice constant field `{}` at {start}..{} lies outside its {} bytes",
+                    field.name,
+                    start + field_size,
+                    image.len()
+                ))
+            );
+        };
+        let Some(field_bytes) = field_image.iter().copied().collect::<Option<Vec<u8>>>() else {
+            return input_err!(
+                loc,
+                TranslationErr::unsupported(format!(
+                    "DisjointSlice constant field `{}` has uninitialized bytes",
+                    field.name
+                ))
+            );
+        };
+        let field_ty = types::translate_type(ctx, &field_rust_ty)?;
+        let (value, new_prev_op) = translate_constant_value_from_bytes(
+            ctx,
+            &field_rust_ty,
+            field_ty,
+            &field_bytes,
+            block_ptr,
+            current_prev_op,
+            loc.clone(),
+        )?;
+        field_values.push(value);
+        current_prev_op = new_prev_op;
+    }
+
+    let (op, value, current_prev_op) = super::aggregate::construct_disjoint_slice_aggregate(
+        ctx,
+        const_ty_ptr,
+        &field_values,
+        block_ptr,
+        current_prev_op,
+        loc,
+    )?;
+    let op = op.expect("construct_disjoint_slice_aggregate always builds an op");
+    if let Some(prev) = current_prev_op {
+        op.insert_after(ctx, prev);
+    } else {
+        op.insert_at_front(block_ptr, ctx);
+    }
+    Ok((value, Some(op)))
+}
+
 /// Translate one field-sized byte slice into a constant value.
 pub(super) fn translate_constant_value_from_bytes(
     ctx: &mut Context,
@@ -1199,6 +1407,17 @@ pub(super) fn translate_constant_value_from_bytes(
     if ty_ptr.deref(ctx).is::<dialect_mir::types::MirTupleType>() {
         return translate_tuple_constant_from_bytes(
             ctx, rust_ty, ty_ptr, bytes, block_ptr, prev_op, loc,
+        );
+    }
+    // a plain byte image has already lost provenance and zeroed its padding,
+    // so every byte reads as initialized
+    if ty_ptr
+        .deref(ctx)
+        .is::<dialect_mir::types::MirDisjointSliceType>()
+    {
+        let image: Vec<Option<u8>> = bytes.iter().copied().map(Some).collect();
+        return translate_disjoint_slice_constant_from_image(
+            ctx, &image, rust_ty, ty_ptr, block_ptr, prev_op, loc,
         );
     }
 

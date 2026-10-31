@@ -20,6 +20,17 @@
 //!   read at the access site is the third operand, and a width written into
 //!   the length slot would resolve every row somewhere else.
 //!
+//! - `skip_partial` passes `DisjointSlice::empty()` and
+//!   `DisjointSlice::default()` to helpers whose second output is optional.
+//!   rustc folds the empty slice into a constant, which import has to
+//!   rebuild as a slice value; the helpers then keep it across a call, by
+//!   value and by `&mut`, and read its length.
+//! - `skip_partial_consts` passes named empty-slice constants by value: a flat
+//!   slice, a runtime-width slice whose image ends in padding, and a tuple
+//!   holding a slice beside a scalar. Each reaches import as a constant to
+//!   decode, and the padding and the nested field are the shapes that need
+//!   care.
+//!
 //! Each element's expected value depends on its own index, so a kernel that
 //! wrote a constant, or that addressed the wrong element, fails the check
 //! rather than passing quietly.
@@ -35,6 +46,14 @@ const BLOCK: u32 = 128;
 /// length read as a row width, lands somewhere visible.
 const ROW_WIDTH: u32 = 37;
 const ROWS: u32 = 24;
+/// Added by `skip_partial_consts`, so its output differs from `skip_partial`'s
+const TAG: u64 = 7;
+
+/// The empty slices `skip_partial_consts` passes as named constants
+const NO_PARTIAL: DisjointSlice<'static, f32> = DisjointSlice::empty();
+/// Pointer, length and row width, then four bytes of padding
+const NO_GRID: DisjointSlice<'static, f32, Runtime2DIndex> = DisjointSlice::empty();
+const TAGGED_PARTIAL: (DisjointSlice<'static, f32>, u64) = (DisjointSlice::empty(), TAG);
 
 #[cuda_module]
 mod kernels {
@@ -82,6 +101,59 @@ mod kernels {
     pub unsafe fn scale_row_width_slice(ptr: *mut f32, len: usize, row_width: u32) {
         let mut grid = unsafe { DisjointSlice::from_raw_parts_with_space(ptr, len, row_width) };
         scale_row(&mut grid, 2.0);
+    }
+
+    /// Write this thread's index plus the partial buffer's length to `out`,
+    /// and a marker to `partial` when it has a slot for this thread.
+    #[device]
+    fn index_with_partial<'a>(
+        out: &mut DisjointSlice<'a, f32>,
+        mut partial: DisjointSlice<'a, f32>,
+    ) {
+        let extra = partial.len() as f32;
+        if let Some(slot) = partial.get_mut(thread::index_1d()) {
+            *slot = -1.0;
+        }
+        if let Some((value, index)) = out.get_mut_indexed() {
+            *value = index.get() as f32 + extra;
+        }
+    }
+
+    /// Callers that do not want the partial output pass an empty slice, with
+    /// no `unsafe` block at the call site. The runtime-width call must find
+    /// no cell, because an empty slice carries a row width of zero.
+    #[kernel]
+    pub fn skip_partial(mut out: DisjointSlice<f32>) {
+        index_with_partial(&mut out, DisjointSlice::empty());
+        scale_row(&mut DisjointSlice::default(), 0.0);
+    }
+
+    /// Take the runtime-width slice by value, so a constant argument stays a
+    /// constant at the call.
+    #[device]
+    fn scale_owned_row<'a>(mut grid: DisjointSlice<'a, f32, Runtime2DIndex>, factor: f32) {
+        scale_row(&mut grid, factor);
+    }
+
+    /// Add the tag, plus the slice's length of zero, to this thread's element,
+    /// and write a marker to the slice when it has a slot for this thread.
+    #[device]
+    fn add_tag<'a>(out: &mut DisjointSlice<'a, f32>, tagged: (DisjointSlice<'a, f32>, u64)) {
+        let (mut partial, tag) = tagged;
+        if let Some(slot) = partial.get_mut(thread::index_1d()) {
+            *slot = -1.0;
+        }
+        if let Some(value) = out.get_mut(thread::index_1d()) {
+            *value += tag as f32 + partial.len() as f32;
+        }
+    }
+
+    /// `skip_partial` with named constants in place of the calls.
+    #[kernel]
+    pub fn skip_partial_consts(mut out: DisjointSlice<f32>) {
+        index_with_partial(&mut out, NO_PARTIAL);
+        scale_owned_row(NO_GRID, 0.0);
+        add_tag(&mut out, TAGGED_PARTIAL);
     }
 }
 
@@ -153,6 +225,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!("scale_row_width_slice: {grid_len} elements at row width {ROW_WIDTH}, exact match");
+
+    // Empty optional output: each element holds its own index, plus the
+    // empty slice's length of zero, and nothing else was written.
+    let mut out = DeviceBuffer::<f32>::zeroed(&stream, LEN as usize)?;
+    // SAFETY: a 1D launch over exactly LEN elements gives each thread one.
+    unsafe { module.skip_partial(&stream, config, &mut out)? };
+    stream.synchronize()?;
+    let got = out.to_host_vec(&stream)?;
+    for (i, value) in got.iter().enumerate() {
+        let expected = i as f32;
+        if *value != expected {
+            return Err(
+                format!("skip_partial: element {i} is {value}, expected {expected}").into(),
+            );
+        }
+    }
+    println!("skip_partial: {LEN} elements, empty optional output skipped");
+
+    // Named constants: each element holds its own index plus the tag
+    let mut out = DeviceBuffer::<f32>::zeroed(&stream, LEN as usize)?;
+    // SAFETY: a 1D launch over exactly LEN elements gives each thread one.
+    unsafe { module.skip_partial_consts(&stream, config, &mut out)? };
+    stream.synchronize()?;
+    let got = out.to_host_vec(&stream)?;
+    for (i, value) in got.iter().enumerate() {
+        let expected = (i as u64 + TAG) as f32;
+        if *value != expected {
+            return Err(format!(
+                "skip_partial_consts: element {i} is {value}, expected {expected}"
+            )
+            .into());
+        }
+    }
+    println!("skip_partial_consts: {LEN} elements, constant empty slices skipped");
 
     println!("SUCCESS: disjoint slices built in-kernel behave like parameter slices");
     Ok(())

@@ -8,7 +8,8 @@
 use super::coerce::{cast_struct_fields_to_expected_types, coerce_slice_data_pointee};
 use super::const_bytes::{
     constant_storage_size, rust_array_type_info, rust_type_layout_size,
-    translate_constant_value_from_bytes, translate_zero_sized_constant_value,
+    translate_constant_value_from_bytes, translate_disjoint_slice_constant_from_alloc,
+    translate_zero_sized_constant_value,
 };
 use super::const_enum::{read_uint_from_bytes, translate_enum_constant_from_alloc};
 use super::const_union::translate_union_constant_from_alloc;
@@ -939,6 +940,25 @@ pub(super) fn translate_constant_value_from_alloc(
         )?;
         return translate_constant_value_from_bytes(
             ctx, rust_ty, ty_ptr, &bytes, block_ptr, prev_op, loc,
+        );
+    }
+
+    // a slice nested in a larger constant, decoded at its own offset so the
+    // padding after its fields is skipped and its range is checked for
+    // provenance like a top-level slice constant
+    let is_disjoint_slice = ty_ptr
+        .deref(ctx)
+        .is::<dialect_mir::types::MirDisjointSliceType>();
+    if is_disjoint_slice {
+        return translate_disjoint_slice_constant_from_alloc(
+            ctx,
+            alloc,
+            absolute_byte_offset,
+            rust_ty,
+            ty_ptr,
+            block_ptr,
+            prev_op,
+            loc,
         );
     }
 

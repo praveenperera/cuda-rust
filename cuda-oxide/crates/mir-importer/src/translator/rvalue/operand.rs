@@ -12,7 +12,8 @@ use super::const_alloc::{
 };
 use super::const_bytes::{
     constant_bytes, translate_array_value_constant, translate_constant_value_from_bytes,
-    translate_struct_constant, translate_tuple_constant, translate_zero_sized_constant_value,
+    translate_disjoint_slice_constant, translate_struct_constant, translate_tuple_constant,
+    translate_zero_sized_constant_value,
 };
 use super::const_enum::{read_uint_from_bytes, translate_enum_constant};
 use super::const_union::translate_union_constant;
@@ -533,6 +534,24 @@ pub fn translate_operand(
                     op.insert_at_front(block_ptr, ctx);
                 }
                 return Ok((op.deref(ctx).get_result(0), Some(op)));
+            }
+
+            // A `DisjointSlice` gets its own slice type rather than a struct,
+            // so it needs its own decoder (`DisjointSlice::empty()` folds to
+            // a constant)
+            if const_ty_ptr
+                .deref(ctx)
+                .is::<dialect_mir::types::MirDisjointSliceType>()
+            {
+                return translate_disjoint_slice_constant(
+                    ctx,
+                    constant,
+                    &rust_ty,
+                    const_ty_ptr,
+                    block_ptr,
+                    prev_op,
+                    loc,
+                );
             }
 
             // Check if this is a struct type (non-ZST)
