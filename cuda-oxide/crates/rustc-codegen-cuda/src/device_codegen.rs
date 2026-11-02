@@ -863,21 +863,23 @@ impl From<std::io::Error> for DeviceCodegenError {
 /// each monomorphization a separate item for the collector, a host-side
 /// requirement rather than a device-code intent; as `noinline` it would keep
 /// every call and stop const-generic arguments from folding into their callers.
-/// The macro's attribute comes first, so rustc keeps it and reports an inline
-/// attribute the user adds there as unused: on such functions a user's own
-/// inline attribute never reached device code, before or after this mapping.
-/// Unnamed instances never match (`opt_item_name`). The test keys on the
-/// device symbol name plus own generics, which is enough while the macro
-/// always writes its attribute first. Once #1472 lets a user's inline
-/// attribute replace the macro's, this test must key on where the attribute
-/// came from instead (`AttributeKind::Inline(_, span)` with
-/// `span.from_expansion()`), or it would drop a user's own `#[inline(never)]`.
+/// The macro writes it only when the user wrote no inline attribute of their
+/// own (#1472), so a user's `#[inline(never)]` on the same function is a real
+/// device-code intent and must reach LLVM as `noinline`. The two are told apart
+/// by where the attribute came from: the macro's tokens carry its call-site
+/// span, which is from an expansion, while the user's keep their source span.
+/// Inline attributes are not encoded across crates, so for an instance defined
+/// in another crate the origin is unknown and the attribute is treated as the
+/// macro's, as it was before #1472. Unnamed instances never match
+/// (`opt_item_name`).
 fn is_generic_device_collector_boundary<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
     let def_id = instance.def_id();
     tcx.generics_of(def_id).own_requires_monomorphization()
         && tcx
             .opt_item_name(def_id)
             .is_some_and(|name| reserved_oxide_symbols::is_device_symbol(name.as_str()))
+        && rustc_attr_ir::find_attr!(tcx, def_id, Inline(_, span) => *span)
+            .is_none_or(|span| span.from_expansion())
 }
 
 /// Generates PTX for device functions using the cuda-oxide pipeline.

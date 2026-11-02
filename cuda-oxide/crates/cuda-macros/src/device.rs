@@ -5,10 +5,7 @@
 
 //! `#[device]` functions and extern blocks, plus `#[constant]` statics.
 
-use crate::common::{
-    attr_path_ends_with, impl_trait_parameter_error, reject_reserved_name,
-    track_codegen_environment,
-};
+use crate::common::{impl_trait_parameter_error, reject_reserved_name, track_codegen_environment};
 use crate::cuda_module::constants::extract_constant_inner_ty;
 use crate::cuda_module::launchers::{codegen_generic_arguments, has_codegen_generics};
 use crate::kernel::scope::{forwarding_inputs, inject_device_thread_index_scope};
@@ -189,11 +186,13 @@ pub(crate) fn device_function_tokens(mut input: ItemFn) -> TokenStream2 {
         };
 
         // A user `inline` attribute replaces the default. rustc expands
-        // `cfg_attr` before it calls this macro.
+        // `cfg_attr` before it calls this macro. Only the bare builtin path
+        // counts: a tool or user attribute such as `#[clippy::inline]` sets no
+        // inline policy, so it must not suppress the collector boundary.
         let has_inline_attr = input
             .attrs
             .iter()
-            .any(|attr| attr_path_ends_with(attr, "inline"));
+            .any(|attr| attr.path().is_ident("inline"));
         let default_inline = (!has_inline_attr).then(|| quote! { #[inline(never)] });
 
         quote! {
