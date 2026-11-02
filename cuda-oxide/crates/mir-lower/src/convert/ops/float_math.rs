@@ -78,7 +78,7 @@ impl FloatMathLowering for RustFloatMathIntrinsic {
             if self.minmax_nsz_predicate().is_some() {
                 pliron::input_error!(
                     loc,
-                    "float max/min intrinsics lower to a compare/select expansion, never to libdevice"
+                    "float max/min intrinsics lower to max.f32/min.f32 or a compare/select expansion, never to libdevice"
                 )
             } else {
                 pliron::input_error!(
@@ -177,6 +177,9 @@ pub fn convert_rust_float_math_intrinsic(
             propagate_nan,
         } => lower_float_ieee_minmax(ctx, rewriter, op, intrinsic, &args, is_max, propagate_nan),
         RustFloatMathLowering::MinMaxNsz { is_max } => {
+            if let Some(symbol) = native_minmax_nsz_symbol(ctx, intrinsic) {
+                return lower_native_minmax_nsz(ctx, rewriter, op, &args, symbol, loc);
+            }
             let predicate = if is_max {
                 FCmpPredicateAttr::OGE
             } else {
@@ -280,6 +283,20 @@ fn lower_scalar_call(
 ) -> Result<()> {
     let result_ty = validate_scalar_signature(ctx, op, intrinsic, is_f64, args, loc.clone())?;
     let intrinsic_name = float_math_intrinsic_symbol(ctx, intrinsic, result_ty, loc.clone())?;
+    emit_direct_intrinsic_call(ctx, rewriter, op, intrinsic_name, result_ty, args, loc)
+}
+
+/// Replace `op` with a direct call to the LLVM intrinsic or libdevice function `intrinsic_name`,
+/// declaring it in the enclosing module first.
+fn emit_direct_intrinsic_call(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    intrinsic_name: &'static str,
+    result_ty: TypeHandle,
+    args: &[Value],
+    loc: pliron::location::Location,
+) -> Result<()> {
     let arg_types = args.iter().map(|arg| arg.get_type(ctx)).collect::<Vec<_>>();
     let func_ty = llvm_types::FuncType::get(ctx, result_ty, arg_types, false);
     let parent_block = op.deref(ctx).get_parent_block().ok_or_else(|| {
@@ -907,6 +924,50 @@ fn lower_float_ieee_minmax(
     rewriter.insert_operation(ctx, result.get_operation());
     rewriter.replace_operation(ctx, op, result.get_operation());
     Ok(())
+}
+
+/// Native NVVM intrinsic for a NaN-ignoring `min`/`max`, when the active backend has one.
+///
+/// Only f32 under the LLVM NVPTX backend qualifies: `llvm.nvvm.fmax.f` /
+/// `llvm.nvvm.fmin.f` (the non-`.NaN`, non-`.ftz` forms) select `max.f32` /
+/// `min.f32`, which return the other operand when one is NaN, as Rust's
+/// `max`/`min` require. f64 deliberately keeps the compare/select expansion
+/// for now, although `llvm.nvvm.fmax.d` / `llvm.nvvm.fmin.d` exist, and
+/// libNVVM keeps it for both widths. `llvm.maxnum`/`llvm.minnum` stay unused because
+/// under LLVM 21 they propagate signaling NaNs (#390).
+fn native_minmax_nsz_symbol(
+    ctx: &Context,
+    intrinsic: RustFloatMathIntrinsic,
+) -> Option<&'static str> {
+    if !matches!(
+        crate::context::lowering_options(ctx).intrinsic_backend,
+        crate::IntrinsicBackend::LlvmNvptx
+    ) {
+        return None;
+    }
+    match intrinsic {
+        RustFloatMathIntrinsic::MaxNumNszF32 => Some("llvm_nvvm_fmax_f"),
+        RustFloatMathIntrinsic::MinNumNszF32 => Some("llvm_nvvm_fmin_f"),
+        _ => None,
+    }
+}
+
+/// Lower an f32 `min`/`max` to its native NVVM intrinsic `symbol`.
+fn lower_native_minmax_nsz(
+    ctx: &mut Context,
+    rewriter: &mut DialectConversionRewriter,
+    op: Ptr<Operation>,
+    args: &[Value],
+    symbol: &'static str,
+    loc: pliron::location::Location,
+) -> Result<()> {
+    let f32_ty: TypeHandle = FP32Type::get(ctx).into();
+    let mir_result_ty = op.deref(ctx).get_result(0).get_type(ctx);
+    let result_ty = convert_type(ctx, mir_result_ty).map_err(anyhow_to_pliron)?;
+    if result_ty != f32_ty || args.iter().any(|arg| arg.get_type(ctx) != f32_ty) {
+        return pliron::input_err!(loc, "f32 min/max signature mismatch");
+    }
+    emit_direct_intrinsic_call(ctx, rewriter, op, symbol, result_ty, args, loc)
 }
 
 /// Lower Rust's NaN-ignoring `min` and `max` contract without libdevice.
