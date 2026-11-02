@@ -69,7 +69,7 @@ experience.
 
 An optimized verbose build also checks the exact LLVM IR that will be passed to
 `llc`. If a Rust local's stack allocation survives both cuda-oxide `mem2reg` and
-LLVM's `-O2` scalar-replacement pipeline, cuda-oxide reports it before PTX
+LLVM's `-O3` scalar-replacement pipeline, cuda-oxide reports it before PTX
 generation. For example:
 
 ```text
@@ -86,12 +86,26 @@ pattern is not one of the conservative cases cuda-oxide recognizes, the warning
 still identifies the local but gives a generic scalar-replacement explanation
 rather than guessing at the cause.
 
-The check runs only after a successful LLVM optimization pass and only in
-verbose mode:
+One case is reported in every optimized build, not just verbose ones: a local
+indexed by the counter of a loop that LLVM left rolled, when the loop's bound is
+a compile-time constant. A small counted loop
+that fills an array, such as `for e in 0..4 { r[e] = f(a[e]) }`, keeps the
+array in registers only if the loop is unrolled. When the body is too large for
+LLVM's unroll threshold, the array moves to local memory:
+
+```text
+warning: local `v` (`[F32x4; 8]`, 128 bytes) in `softmax` could not be promoted to registers
+  = note: indexed by the counter of a loop LLVM did not unroll, so the array stays in local memory
+  = help: add `#[unroll]` to that loop so every index becomes a constant; if it already has one, raise its budget with `#[unroll(max_ops = N)]`
+```
+
+Every other case appears only in verbose mode:
 
 ```bash
 cargo oxide build <example> --verbose
 ```
+
+All of these checks run only after a successful LLVM optimization pass.
 
 This placement matters. Reporting immediately after cuda-oxide `mem2reg` would
 produce false positives for allocations that LLVM SROA removes later. The check

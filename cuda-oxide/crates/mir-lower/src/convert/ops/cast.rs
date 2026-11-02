@@ -932,7 +932,7 @@ fn emit_int_to_ptr(
 /// types (an aggregate bitcast such as `bitcast [4 x i8] %v to i32` is
 /// rejected by `llc` with "invalid cast opcode"). The slot sits in the
 /// function's entry block and only this store/load pair touches it, so one
-/// slot serves every execution, even in a loop, and the `opt -O2` middle
+/// slot serves every execution, even in a loop, and the `opt -O3` middle
 /// end (SROA) folds the round-trip away: no real stack traffic survives.
 ///
 /// Guarded by a total-byte-size equality check so a size-mismatched

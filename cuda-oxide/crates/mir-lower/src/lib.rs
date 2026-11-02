@@ -436,7 +436,7 @@ pub fn lower_mir_to_llvm_with_options(
     let mut rewriter = IRRewriter::<Recorder>::default();
     remove_blocks_inside_op(module_op, ctx, &mut rewriter);
     // mem2reg promotes enum/struct slots into whole-aggregate block arguments,
-    // which export as PHIs of first-class aggregates. LLVM's -O2 pipeline
+    // which export as PHIs of first-class aggregates. LLVM's -O3 pipeline
     // cannot split those (SROA only handles allocas), so e.g. an iterator
     // loop merging `Option<(f32, f32)>` keeps a materialized discriminant and
     // an extra branch per iteration. Split such arguments into scalar leaves
