@@ -21,6 +21,7 @@
 //! `for e in 0..4 { r[e] = .. }` fill), and it costs a stack frame and
 //! local-memory traffic in every thread.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -75,8 +76,10 @@ fn diagnose_text(llvm: &str, reporting: Reporting) -> Vec<String> {
     let mut diagnostics = Vec::new();
     for function in function_bodies(llvm) {
         let function_name = demangle_function_name(&function.name);
+        // built on first use and shared by every local of the function
+        let definitions = OnceCell::new();
         for alloca in surviving_allocas(&function) {
-            let blocker = classify_promotion_blocker(&function.lines, &alloca.value);
+            let blocker = classify_promotion_blocker(&function.lines, &alloca.value, &definitions);
             if reporting == Reporting::LoopCounterIndexOnly
                 && blocker != PromotionBlocker::LoopCounterIndex
             {
@@ -201,7 +204,11 @@ fn decode_provenance_name(value: &str) -> Option<LocalProvenance> {
     })
 }
 
-fn classify_promotion_blocker(lines: &[&str], root: &str) -> PromotionBlocker {
+fn classify_promotion_blocker<'a>(
+    lines: &[&'a str],
+    root: &str,
+    definitions: &OnceCell<BTreeMap<&'a str, IntegerDefinition<'a>>>,
+) -> PromotionBlocker {
     let pointer_values = derived_pointer_values(lines, root);
     let dynamic_indices: Vec<&str> = lines
         .iter()
@@ -209,11 +216,8 @@ fn classify_promotion_blocker(lines: &[&str], root: &str) -> PromotionBlocker {
         .collect();
 
     if !dynamic_indices.is_empty() {
-        let definitions = integer_definitions(lines);
-        if dynamic_indices
-            .iter()
-            .any(|index| derives_from_induction_variable(index, &definitions))
-        {
+        let definitions = definitions.get_or_init(|| integer_definitions(lines));
+        if derives_from_induction_variable(&dynamic_indices, definitions) {
             return PromotionBlocker::LoopCounterIndex;
         }
         return PromotionBlocker::DynamicIndex;
@@ -310,9 +314,9 @@ struct IntegerDefinition<'a> {
     /// Whether this widens an `i1`: Rust's `Range::next` advances its counter
     /// by `zext i1 %has_next`, not by a literal 1.
     is_bool_zext: bool,
-    /// Whether an `icmp` compares this value with a literal: a loop bound
-    /// known at compile time, the only kind `#[unroll]` can fully unroll.
-    compared_to_literal: bool,
+    /// Whether a branch tests this value against a literal: a loop bound known
+    /// at compile time, the only kind `#[unroll]` can fully unroll.
+    branches_on_literal_compare: bool,
 }
 
 /// Opcodes an index can be computed through on its way from a loop counter.
@@ -324,19 +328,27 @@ const INDEX_ARITHMETIC: &[&str] = &[
 ];
 
 fn integer_definitions<'a>(lines: &[&'a str]) -> BTreeMap<&'a str, IntegerDefinition<'a>> {
-    let mut compared_to_literal = BTreeSet::new();
+    // conditions of `br i1 %cond, ...`: a compare that decides control flow,
+    // such as a loop's exit test, rather than one that only feeds data
+    let branch_conditions: BTreeSet<&str> = lines
+        .iter()
+        .filter_map(|line| line.trim_start().strip_prefix("br i1 "))
+        .filter_map(|rest| value_tokens(rest).next())
+        .collect();
+
+    let mut branches_on_literal_compare = BTreeSet::new();
     for line in lines {
-        let Some((_, rhs)) = assignment(line) else {
+        let Some((lhs, rhs)) = assignment(line) else {
             continue;
         };
-        if !rhs.starts_with("icmp ") {
+        if !rhs.starts_with("icmp ") || !branch_conditions.contains(lhs) {
             continue;
         }
         let has_literal = rhs
             .split(|ch: char| ch.is_ascii_whitespace() || ch == ',')
             .any(|token| !token.is_empty() && token.parse::<i64>().is_ok());
         if has_literal {
-            compared_to_literal.extend(value_tokens(rhs));
+            branches_on_literal_compare.extend(value_tokens(rhs));
         }
     }
 
@@ -362,86 +374,112 @@ fn integer_definitions<'a>(lines: &[&'a str]) -> BTreeMap<&'a str, IntegerDefini
                 operands: value_tokens(rhs).collect(),
                 has_literal_operand,
                 is_bool_zext: rhs.starts_with("zext i1 "),
-                compared_to_literal: compared_to_literal.contains(lhs),
+                branches_on_literal_compare: branches_on_literal_compare.contains(lhs),
             },
         );
     }
     definitions
 }
 
-/// Whether `index` is computed from a loop induction variable: its operand
-/// graph reaches a cycle made only of `phi`s and steps by a literal (`%i.next =
-/// add %i, 1`) or by a widened `i1` (Rust's range desugaring). Unrolling that
-/// loop is what turns such an index into a constant. A recurrence that steps
-/// by loaded data, or mixes in other arithmetic such as a hash's `mul`, is not
-/// a counter, and unrolling would not help it. Nor is a counter whose loop
-/// bound is only known at run time.
+/// Whether any of `indices` is computed from a loop induction variable: its
+/// operand graph reaches a cycle made only of `phi`s and steps by a literal
+/// (`%i.next = add %i, 1`) or by a widened `i1` (Rust's range desugaring), and
+/// a literal compare of a cycle member decides a branch. Unrolling that loop is
+/// what turns such an index into a constant. A recurrence that steps by loaded
+/// data, or mixes in other arithmetic such as a hash's `mul`, is not a
+/// counter, and unrolling would not help it. Nor is a counter whose loop bound
+/// is only known at run time.
 fn derives_from_induction_variable(
-    index: &str,
+    indices: &[&str],
     definitions: &BTreeMap<&str, IntegerDefinition<'_>>,
 ) -> bool {
-    /// Depth-first search state per value: on the current path, or finished.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Visit {
-        OnPath,
-        Done,
+    // one search state for every index of a local: a value already explored
+    // from an earlier index has nothing new to offer, which keeps the whole
+    // check linear in the function's size
+    let mut state = BTreeMap::new();
+    indices
+        .iter()
+        .any(|index| reaches_counter_cycle(index, definitions, &mut state))
+}
+
+/// Depth-first search state per value: on the current path, or finished.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Visit {
+    OnPath,
+    Done,
+}
+
+fn reaches_counter_cycle<'a>(
+    root: &'a str,
+    definitions: &BTreeMap<&'a str, IntegerDefinition<'a>>,
+    state: &mut BTreeMap<&'a str, Visit>,
+) -> bool {
+    if state.contains_key(root) || !definitions.contains_key(root) {
+        return false;
     }
 
-    fn visit<'a>(
-        value: &'a str,
-        definitions: &BTreeMap<&'a str, IntegerDefinition<'a>>,
-        state: &mut BTreeMap<&'a str, Visit>,
-        path: &mut Vec<&'a str>,
-    ) -> bool {
-        match state.get(value) {
-            Some(Visit::OnPath) => {
-                // a cycle: an induction variable when it is made only of phis
-                // and counter-like steps. Any other opcode in the cycle (the
-                // `mul` of a `h * a + c` hash) makes the value data that
-                // unrolling would not turn into a constant
-                let start = path.iter().rposition(|step| *step == value).unwrap_or(0);
-                let cycle = &path[start..];
-                let is_step = |definition: &IntegerDefinition<'_>| {
-                    matches!(definition.opcode, "add" | "sub" | "or")
-                        && (definition.has_literal_operand
-                            || definition.operands.iter().any(|operand| {
-                                definitions
-                                    .get(operand)
-                                    .is_some_and(|operand| operand.is_bool_zext)
-                            }))
-                };
-                let only_counter_ops = cycle.iter().all(|step| {
-                    let definition = &definitions[step];
-                    definition.opcode == "phi" || is_step(definition)
-                });
-                let has_phi = cycle.iter().any(|step| definitions[step].opcode == "phi");
-                let steps = cycle.iter().any(|step| is_step(&definitions[step]));
-                // a runtime trip count (`0..n`) keeps the index dynamic even
-                // under `#[unroll]`, so only a literal bound qualifies
-                let bounded = cycle
-                    .iter()
-                    .any(|step| definitions[step].compared_to_literal);
-                return only_counter_ops && has_phi && steps && bounded;
-            }
-            Some(Visit::Done) => return false,
-            None => {}
-        }
-        let Some(definition) = definitions.get(value) else {
-            return false;
+    // an explicit stack of (value, next operand to visit) rather than
+    // recursion: an unrolled body can chain tens of thousands of integer ops,
+    // which would overflow rustc's thread stack
+    let mut stack: Vec<(&'a str, usize)> = vec![(root, 0)];
+    state.insert(root, Visit::OnPath);
+    while let Some(top) = stack.last_mut() {
+        let value = top.0;
+        let Some(&operand) = definitions[value].operands.get(top.1) else {
+            state.insert(value, Visit::Done);
+            stack.pop();
+            continue;
         };
+        top.1 += 1;
 
-        state.insert(value, Visit::OnPath);
-        path.push(value);
-        let found = definition
-            .operands
-            .iter()
-            .any(|operand| visit(operand, definitions, state, path));
-        path.pop();
-        state.insert(value, Visit::Done);
-        found
+        match state.get(operand) {
+            Some(Visit::OnPath) => {
+                let start = stack
+                    .iter()
+                    .rposition(|(step, _)| *step == operand)
+                    .unwrap_or(0);
+                let cycle: Vec<&str> = stack[start..].iter().map(|(step, _)| *step).collect();
+                if is_counter_cycle(&cycle, definitions) {
+                    return true;
+                }
+            }
+            Some(Visit::Done) => {}
+            None => {
+                if definitions.contains_key(operand) {
+                    state.insert(operand, Visit::OnPath);
+                    stack.push((operand, 0));
+                }
+            }
+        }
     }
+    false
+}
 
-    visit(index, definitions, &mut BTreeMap::new(), &mut Vec::new())
+/// Whether a def-use cycle is a loop counter. It must be made only of phis and
+/// counter-like steps: any other opcode (the `mul` of a `h * a + c` hash)
+/// makes the value data that unrolling would not turn into a constant. And a
+/// runtime trip count (`0..n`) keeps the index dynamic even under `#[unroll]`,
+/// so the loop's bound must be a literal.
+fn is_counter_cycle(cycle: &[&str], definitions: &BTreeMap<&str, IntegerDefinition<'_>>) -> bool {
+    let is_step = |definition: &IntegerDefinition<'_>| {
+        matches!(definition.opcode, "add" | "sub" | "or")
+            && (definition.has_literal_operand
+                || definition.operands.iter().any(|operand| {
+                    definitions
+                        .get(operand)
+                        .is_some_and(|operand| operand.is_bool_zext)
+                }))
+    };
+    let only_counter_ops = cycle.iter().all(|step| {
+        let definition = &definitions[step];
+        definition.opcode == "phi" || is_step(definition)
+    });
+    let has_phi = cycle.iter().any(|step| definitions[step].opcode == "phi");
+    let steps = cycle.iter().any(|step| is_step(&definitions[step]));
+    let bounded = cycle
+        .iter()
+        .any(|step| definitions[step].branches_on_literal_compare);
+    only_counter_ops && has_phi && steps && bounded
 }
 
 fn address_escapes(line: &str, pointers: &BTreeSet<String>) -> bool {
@@ -655,6 +693,37 @@ mod tests {
             .replace("@kernel()", "@kernel(i64 %n)")
             .replace("icmp eq i64 %step, 5", "icmp eq i64 %step, %n");
         assert!(diagnose_text(&llvm, Reporting::LoopCounterIndexOnly).is_empty());
+        assert_eq!(diagnose_text(&llvm, Reporting::All).len(), 1);
+    }
+
+    #[test]
+    fn literal_compare_off_the_exit_branch_is_not_a_bound() {
+        // `if i == 0 { .. }` inside `for i in 0..n`: the literal compare feeds
+        // data, not the loop's exit test, so the trip count is still runtime
+        let name = alloca_name("3\t16\tarr\t[u32; 4]");
+        let llvm = rolled_counter_loop(&name)
+            .replace("@kernel()", "@kernel(i64 %n)")
+            .replace("icmp eq i64 %step, 5", "icmp eq i64 %step, %n")
+            .replace(
+                "  store float 1.0, ptr %slot, align 4\n",
+                "  %first = icmp eq i64 %next, 1\n  %value = select i1 %first, float 1.0, float 2.0\n  store float %value, ptr %slot, align 4\n",
+            );
+        assert!(diagnose_text(&llvm, Reporting::LoopCounterIndexOnly).is_empty());
+        assert_eq!(diagnose_text(&llvm, Reporting::All).len(), 1);
+    }
+
+    #[test]
+    fn long_index_chains_do_not_overflow_the_stack() {
+        // a fully unrolled hash can feed an index through a very long chain of
+        // integer ops; the search must not recurse once per link
+        let name = alloca_name("3\t16\tt\t[u32; 4]");
+        let mut body = String::from("  %v0 = add i64 %seed, 1\n");
+        for link in 1..100_000 {
+            body.push_str(&format!("  %v{link} = xor i64 %v{}, 7\n", link - 1));
+        }
+        let llvm = format!(
+            "define void @kernel(i64 %seed) {{\nentry:\n  {name} = alloca [4 x i32], align 4\n{body}  %slot = getelementptr [4 x i32], ptr {name}, i64 0, i64 %v99999\n  store i32 1, ptr %slot, align 4\n  ret void\n}}\n"
+        );
         assert_eq!(diagnose_text(&llvm, Reporting::All).len(), 1);
     }
 
