@@ -24,7 +24,7 @@
 //! `rintf`, `fma` and `fmaf`.
 //!
 //! Overriding the `cross_crate_inlinable` query for the `libm` crate's own
-//! items fixes this at the source. The override runs while `libm` itself is
+//! functions fixes this at the source. The override runs while `libm` itself is
 //! compiled (cargo-oxide builds every crate with this backend), so libm's
 //! exports and the metadata downstream crates read agree: its functions are
 //! exported symbols that other crates call instead of inlining. The cost is
@@ -32,6 +32,7 @@
 //! `libm::sqrtf` becomes a call to libm's `sqrtss` wrapper rather than the
 //! instruction itself.
 
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{LOCAL_CRATE, LocalDefId};
 use rustc_middle::ty::TyCtxt;
 use std::sync::OnceLock;
@@ -42,7 +43,8 @@ const LIBM_CRATE: &str = "libm";
 
 type CrossCrateInlinable = for<'tcx> fn(TyCtxt<'tcx>, LocalDefId) -> bool;
 
-/// rustc's own provider, which the override defers to outside `libm`.
+/// rustc's own provider, which the override defers to for everything but
+/// `libm`'s functions.
 static DEFAULT_CROSS_CRATE_INLINABLE: OnceLock<CrossCrateInlinable> = OnceLock::new();
 
 /// Installs the override on top of whatever provider is already set.
@@ -55,7 +57,11 @@ pub(crate) fn provide(providers: &mut rustc_middle::util::Providers) {
 }
 
 fn cross_crate_inlinable(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
-    if tcx.crate_name(LOCAL_CRATE).as_str() == LIBM_CRATE {
+    // only functions and methods: rustc requires `true` for closures and
+    // constructors, which carry no libm entry point anyway
+    if tcx.crate_name(LOCAL_CRATE).as_str() == LIBM_CRATE
+        && matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn)
+    {
         return false;
     }
 
