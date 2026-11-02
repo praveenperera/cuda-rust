@@ -67,6 +67,18 @@ fn other_attributes_do_not_replace_the_default() {
 }
 
 #[test]
+fn qualified_attributes_named_inline_do_not_replace_the_default() {
+    // tool and user attributes whose last segment is `inline` set no inline
+    // policy, so the collector boundary must stay
+    let function: ItemFn = parse_quote! {
+        #[clippy::inline]
+        #[my_attrs::inline(always)]
+        fn scale<T: Copy>(value: T) -> T { value }
+    };
+    assert_eq!(renamed_inline_attrs(function), ["#[inline(never)]"]);
+}
+
+#[test]
 fn non_generic_device_function_gets_no_inline_attribute() {
     let function: ItemFn = parse_quote! {
         fn scale(value: f32) -> f32 { value }
