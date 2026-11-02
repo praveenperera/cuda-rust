@@ -16,6 +16,19 @@
 //! tuple-returning `sincosf`, and the fmax/fmin/rint lanes. The host
 //! computes the same expressions with stdlib float methods and compares.
 //!
+//! `sqrt`/`sqrtf` and `fma`/`fmaf` pin the libm functions that dispatch to a
+//! per-host `arch` module (x86 `sqrtss` inline asm, aarch64 `fsqrt`). They are
+//! small enough that rustc would MIR-inline them into the kernel, asm and all,
+//! before the call could be rerouted; the backend keeps every libm function a
+//! call so they reach libdevice like the rest.
+//!
+//! `erf_fill_loop` and `erf_pair_loop` call `libm::erff` from small counted
+//! loops that fill a per-thread array by the loop counter, with no `#[unroll]`.
+//! nvcc and clang unroll such loops and keep the array in registers; if LLVM
+//! leaves one rolled, the array moves to local memory. `verify-code-shape.sh`
+//! asserts both kernels have no local memory; GPU-less CI runs it through
+//! `scripts/smoketest.sh --compile-only`.
+//!
 //! Also pins the interception anchor: `libm_lookalike::expf` below is a
 //! user function whose path contains "libm", and it must compile as a
 //! regular device call, never be rerouted to `__nv_expf`.
@@ -26,6 +39,18 @@
 use cuda_core::simt::LaunchConfig;
 use cuda_core::{CudaContext, DeviceBuffer};
 use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
+
+/// GELU through `libm::erff`, the body of the counted-loop kernels.
+#[inline(always)]
+fn gelu(v: f32) -> f32 {
+    0.5 * v * (1.0 + libm::erff(v * core::f32::consts::FRAC_1_SQRT_2))
+}
+
+/// The host reference for the counted-loop kernels: their per-thread arrays
+/// are folded with weights `1..=4`, so a misplaced lane changes the result.
+fn weighted(lanes: [f32; 4]) -> f32 {
+    lanes[0] + 2.0 * lanes[1] + 3.0 * lanes[2] + 4.0 * lanes[3]
+}
 
 /// Adversarial guard for the libm interception anchor: a user function
 /// named like a libm entry point, in a module path containing "libm".
@@ -44,10 +69,6 @@ mod kernels {
     use super::*;
 
     /// f32 libm entry points.
-    // libm::sqrtf / libm::sqrt are not exercised: libm routes sqrt
-    // through an arch-specific inline-asm wrapper that rustc MIR-inlines
-    // into the kernel before the call-site interception can fire, so
-    // sqrt is not yet supported via libm (f32::sqrt / f64::sqrt work).
     #[kernel]
     pub fn libm_f32(x: &[f32], mut out: DisjointSlice<f32>) {
         let idx = thread::index_1d();
@@ -61,7 +82,41 @@ mod kernels {
             let mm = libm::fmaxf(v, 1.0) + libm::fminf(v, 2.0);
             let (sn, cs) = libm::sincosf(v);
             let guard = libm_lookalike::expf(v);
-            *o = trig + e + p + r + mm + sn * cs + guard;
+            let arch = libm::sqrtf(v) + libm::fmaf(v, 1.5, 0.25);
+            *o = trig + e + p + r + mm + sn * cs + guard + arch;
+        }
+    }
+
+    /// A four-step fill loop whose body inlines libdevice's `erff`. Each
+    /// inlined copy must be priced after `__nvvm_reflect` folds, or the loop
+    /// looks twice its size, stays rolled, and `r` goes to local memory.
+    #[kernel]
+    pub fn erf_fill_loop(x: &[f32], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            let mut r = [0.0f32; 4];
+            for e in 0..4 {
+                r[e] = gelu(x[4 * i + e]);
+            }
+            *o = weighted(r);
+        }
+    }
+
+    /// The bias+GELU shape: two `erff` calls per step. Small enough for the
+    /// full-unroll threshold clang `-O3` and nvcc use, not for O2's.
+    #[kernel]
+    pub fn erf_pair_loop(x: &[f32], bias: &[f32], mut out: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            let mut lo = [0.0f32; 4];
+            let mut hi = [0.0f32; 4];
+            for e in 0..4 {
+                lo[e] = gelu(x[8 * i + e] + bias[e]);
+                hi[e] = gelu(x[8 * i + 4 + e] + bias[e]);
+            }
+            *o = weighted(lo) - weighted(hi);
         }
     }
 
@@ -79,7 +134,8 @@ mod kernels {
             let t = libm::atan2(v, 2.0f64);
             let r = libm::rint(v * 2.5);
             let mm = libm::fmax(v, 1.0) + libm::fmin(v, 2.0);
-            *o = trig + e + p + t + r + mm;
+            let arch = libm::sqrt(v) + libm::fma(v, 1.5, 0.25);
+            *o = trig + e + p + t + r + mm + arch;
         }
     }
 }
@@ -121,8 +177,38 @@ fn main() {
     }
     .expect("libm_f64 launch failed");
 
+    let xs: Vec<f32> = (0..8 * N).map(|i| i as f32 * 0.05 - 6.0).collect();
+    let bias = [0.5f32, -0.25, 1.0, -1.5];
+    let xs_dev = DeviceBuffer::from_host(&stream, &xs).unwrap();
+    let bias_dev = DeviceBuffer::from_host(&stream, &bias).unwrap();
+    let mut fill_dev = DeviceBuffer::<f32>::zeroed(&stream, N).unwrap();
+    let mut pair_dev = DeviceBuffer::<f32>::zeroed(&stream, N).unwrap();
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.erf_fill_loop(
+            &stream,
+            LaunchConfig::for_num_elems(N as u32),
+            &xs_dev,
+            &mut fill_dev,
+        )
+    }
+    .expect("erf_fill_loop launch failed");
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.erf_pair_loop(
+            &stream,
+            LaunchConfig::for_num_elems(N as u32),
+            &xs_dev,
+            &bias_dev,
+            &mut pair_dev,
+        )
+    }
+    .expect("erf_pair_loop launch failed");
+
     let o32 = o32_dev.to_host_vec(&stream).unwrap();
     let o64 = o64_dev.to_host_vec(&stream).unwrap();
+    let fill = fill_dev.to_host_vec(&stream).unwrap();
+    let pair = pair_dev.to_host_vec(&stream).unwrap();
 
     let mut ok = true;
     for i in 0..N {
@@ -134,7 +220,8 @@ fn main() {
             + (v.floor() + v.abs() + (v * 2.5).round_ties_even())
             + (v.max(1.0) + v.min(2.0))
             + sn * cs
-            + (v + 1000.0);
+            + (v + 1000.0)
+            + (v.sqrt() + v.mul_add(1.5, 0.25));
         if (o32[i] - want).abs() > 1e-3 * want.abs().max(1.0) {
             println!("f32 mismatch at {i}: got {} want {want}", o32[i]);
             ok = false;
@@ -145,9 +232,21 @@ fn main() {
             + v.powf(1.5)
             + v.atan2(2.0)
             + (v * 2.5).round_ties_even()
-            + (v.max(1.0) + v.min(2.0));
+            + (v.max(1.0) + v.min(2.0))
+            + (v.sqrt() + v.mul_add(1.5, 0.25));
         if (o64[i] - want).abs() > 1e-9 * want.abs().max(1.0) {
             println!("f64 mismatch at {i}: got {} want {want}", o64[i]);
+            ok = false;
+        }
+        let want = weighted(std::array::from_fn(|e| gelu(xs[4 * i + e])));
+        if (fill[i] - want).abs() > 1e-4 * want.abs().max(1.0) {
+            println!("erf_fill_loop mismatch at {i}: got {} want {want}", fill[i]);
+            ok = false;
+        }
+        let want = weighted(std::array::from_fn(|e| gelu(xs[8 * i + e] + bias[e])))
+            - weighted(std::array::from_fn(|e| gelu(xs[8 * i + 4 + e] + bias[e])));
+        if (pair[i] - want).abs() > 1e-4 * want.abs().max(1.0) {
+            println!("erf_pair_loop mismatch at {i}: got {} want {want}", pair[i]);
             ok = false;
         }
     }
