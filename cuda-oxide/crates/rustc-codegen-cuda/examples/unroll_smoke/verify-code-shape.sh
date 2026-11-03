@@ -91,5 +91,14 @@ if log_path:
     print(f"{name}: no not-unrolled warning PASS")
 else:
     print(f"{name}: no build log given, warning check skipped")
+
+# A partial `#[unroll(N)]` marks both its main and its remainder loop
+# `nounroll`. When the request is declined, LLVM leaves
+# `partial_block_stride` rolled and unmarked.
+name = "partial_block_stride"
+pragmas = entry_body(name).count('.pragma "nounroll";')
+if pragmas != 2:
+    sys.exit(f"error: {name} has {pragmas} nounroll loops, expected the unroller's 2")
+print(f"{name}: main and remainder loop PASS")
 print("unroll_smoke PTX shape: PASS")
 PY
