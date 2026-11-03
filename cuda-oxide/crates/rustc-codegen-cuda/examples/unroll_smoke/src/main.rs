@@ -24,14 +24,17 @@
 //! `for i in 0..n { s += row.get(i).unwrap_or(0.0); }` over a `RowView32`,
 //! whose body matches an `Option`. `partial_block_stride` is `#[unroll(4)]`
 //! on a loop that starts at the thread index and steps by the block size.
+//! `partial_low_budget` is a partial request with `max_ops = 8`, too small a
+//! budget for four copies.
 //! All are semantics-preserving; the host checks the sums.
 //!
 //! `verify-code-shape.sh` asserts that `nested_lane_range`,
 //! `const_generic_bound`, and `isize_range_for` have no local memory in the
-//! generated PTX, and that the unroller, not LLVM, split `partial_row_view`
-//! and `partial_block_stride` into a main and a remainder loop. Given the
-//! build log, it also asserts that the build printed no "not unrolled"
-//! warning for `partial_row_view`. GPU-less CI runs it through
+//! generated PTX, that the unroller, not LLVM, split `partial_row_view` and
+//! `partial_block_stride` into a main and a remainder loop, and that it left
+//! `partial_low_budget` alone. Given the build log, it also asserts that the
+//! build printed no "not unrolled" warning for `partial_row_view`. GPU-less
+//! CI runs it through
 //! `scripts/smoketest.sh --compile-only`.
 //!
 //! Run: cargo oxide run unroll_smoke
@@ -731,6 +734,26 @@ mod kernels {
         }
         *out_elem = sum;
     }
+
+    /// `#[unroll(4, max_ops = 8)]` on a `0..n` loop that `#[unroll(4)]` would
+    /// split into a main and a remainder loop. Four body copies need more than
+    /// 8 cloned operations, so the unroller declines it and says so, which
+    /// shows the per-loop budget reaches the pass. Raising the budget needs a
+    /// loop over the default 65,536 operations, too slow to compile for a
+    /// smoke test; the `mir-transforms` tests cover that direction. The result
+    /// is the sum of `input[..n]`.
+    #[kernel]
+    pub fn partial_low_budget(input: &[u32], mut out: DisjointSlice<u32>, n: u32) {
+        let Some(out_elem) = out.get_mut(thread::index_1d()) else {
+            return;
+        };
+        let mut sum = 0u32;
+        #[unroll(4, max_ops = 8)]
+        for i in 0..n {
+            sum = sum.wrapping_add(input[i as usize]);
+        }
+        *out_elem = sum;
+    }
 }
 
 fn main() {
@@ -992,6 +1015,27 @@ fn main() {
             d_row_sum.to_host_vec(&stream).unwrap(),
             vec![want_row_sum; N],
             "partial `0..{row_trip}` over `row.get(i).unwrap_or(0.0)`"
+        );
+        let mut d_low_budget = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
+        // SAFETY: each thread writes its own element; reads stay below `range_trip`.
+        unsafe {
+            module.partial_low_budget(
+                stream.as_ref(),
+                cfg,
+                &d_signed_input,
+                &mut d_low_budget,
+                range_trip,
+            )
+        }
+        .expect("launch partial_low_budget");
+        let want_low_budget = signed_input
+            .iter()
+            .take(range_trip as usize)
+            .fold(0u32, |sum, &x| sum.wrapping_add(x));
+        assert_eq!(
+            d_low_budget.to_host_vec(&stream).unwrap(),
+            vec![want_low_budget; N],
+            "`0..{range_trip}` under `max_ops = 8`"
         );
         let mut d_signed = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
         let mut d_signed_part = DeviceBuffer::<u32>::zeroed(&stream, N).unwrap();
