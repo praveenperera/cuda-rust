@@ -22,7 +22,7 @@
 //!           %p = mir.cast %g        (to the declared `&(u32, u32)`, generic)
 //!                         │
 //!                         ▼
-//!   LLVM:   @__device_global_0 = addrspace(1) constant [8 x i8] c"\03\00\00\00\04\00\00\00"
+//!   LLVM:   @__device_global_<crate>_<hash> = addrspace(1) constant [8 x i8] c"\03\00\00\00\04\00\00\00"
 //! ```
 //!
 //! Each rustc allocation becomes one byte-image global, keyed by its contents
